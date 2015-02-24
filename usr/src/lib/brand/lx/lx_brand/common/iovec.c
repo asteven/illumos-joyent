@@ -22,7 +22,7 @@
 /*
  * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
- * Copyright 2014 Joyent, Inc.  All rights reserved.
+ * Copyright 2015 Joyent, Inc.  All rights reserved.
  */
 
 #include <errno.h>
@@ -46,23 +46,6 @@ lx_is_directory(int fd)
 		sbuf.st_mode = 0;
 
 	return ((sbuf.st_mode & S_IFMT) == S_IFDIR);
-}
-
-long
-lx_read(uintptr_t p1, uintptr_t p2, uintptr_t p3)
-{
-	int 		fd = (int)p1;
-	void		*buf = (void *)p2;
-	size_t		nbyte = (size_t)p3;
-	ssize_t		ret;
-
-	if (lx_is_directory(fd))
-		return (-EISDIR);
-
-	if ((ret = read(fd, buf, nbyte)) < 0)
-		return (-errno);
-
-	return (ret);
 }
 
 #if defined(_LP64)
@@ -297,4 +280,30 @@ lx_writev(uintptr_t p1, uintptr_t p2, uintptr_t p3)
 	}
 
 	return (total);
+}
+
+long
+lx_preadv(uintptr_t p1, uintptr_t p2, uintptr_t p3, uintptr_t p4)
+{
+	int 		fd = (int)p1;
+	const struct iovec *iovp = (const struct iovec *)p2;
+	int		cnt = (int)p3;
+	off_t		off = (off_t)p4;
+	ssize_t		ret;
+
+	ret = preadv(fd, iovp, cnt, off);
+	return (ret < 0 ? -errno : ret);
+}
+
+long
+lx_pwritev(uintptr_t p1, uintptr_t p2, uintptr_t p3, uintptr_t p4)
+{
+	int 		fd = (int)p1;
+	const struct iovec *iovp = (const struct iovec *)p2;
+	int		cnt = (int)p3;
+	off_t		off = (off_t)p4;
+	ssize_t		ret;
+
+	ret = pwritev(fd, iovp, cnt, off);
+	return (ret < 0 ? -errno : ret);
 }

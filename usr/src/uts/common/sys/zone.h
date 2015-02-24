@@ -20,9 +20,10 @@
  */
 /*
  * Copyright (c) 2003, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright 2013, Joyent, Inc. All rights reserved.
  * Copyright 2014 Nexenta Systems, Inc. All rights reserved.
  * Copyright 2014 Igor Kozhukhov <ikozhukhov@gmail.com>.
- * Copyright 2013, Joyent, Inc. All rights reserved.
+ * Copyright 2015, Joyent, Inc. All rights reserved.
  */
 
 #ifndef _SYS_ZONE_H
@@ -250,9 +251,12 @@ typedef enum zone_cmd {
 typedef struct zone_cmd_arg {
 	uint64_t	uniqid;		/* unique "generation number" */
 	zone_cmd_t	cmd;		/* requested action */
-	uint32_t debug;			/* enable brand hook debug */
+	int		status;		/* init status on shutdown */
+	uint32_t	debug;		/* enable brand hook debug */
 	char locale[MAXPATHLEN];	/* locale in which to render messages */
 	char bootbuf[BOOTARGS_MAX];	/* arguments passed to zone_boot() */
+	/* Needed for 32/64 zoneadm -> zoneadmd door arg size check. */
+	int		pad;
 } zone_cmd_arg_t;
 
 /*
@@ -448,15 +452,12 @@ typedef struct {
 	kstat_named_t	zm_avenrun1;
 	kstat_named_t	zm_avenrun5;
 	kstat_named_t	zm_avenrun15;
-	kstat_named_t	zm_run_ticks;
-	kstat_named_t	zm_run_wait;
-	kstat_named_t	zm_fss_shr_pct;
-	kstat_named_t	zm_fss_pri_hi;
-	kstat_named_t	zm_fss_pri_avg;
 	kstat_named_t	zm_ffcap;
 	kstat_named_t	zm_ffnoproc;
 	kstat_named_t	zm_ffnomem;
 	kstat_named_t	zm_ffmisc;
+	kstat_named_t	zm_init_pid;
+	kstat_named_t	zm_boot_time;
 } zone_misc_kstat_t;
 
 typedef struct zone {
@@ -551,7 +552,8 @@ typedef struct zone {
 	kcondvar_t	zone_cv;	/* used to signal state changes */
 	struct proc	*zone_zsched;	/* Dummy kernel "zsched" process */
 	pid_t		zone_proc_initpid; /* pid of "init" for this zone */
-	char		*zone_initname;	/* fs path to 'init' */
+	char		*zone_initname;		/* fs path to 'init' */
+	int		zone_init_status;	/* init's exit status */
 	int		zone_boot_err;  /* for zone_boot() if boot fails */
 	char		*zone_bootargs;	/* arguments passed via zone_boot() */
 	rctl_qty_t	zone_phys_mem_ctl;	/* current phys. memory limit */
@@ -592,6 +594,7 @@ typedef struct zone {
 	tsol_mlp_list_t zone_mlps;	/* MLPs on zone-private addresses */
 
 	boolean_t	zone_restart_init;	/* Restart init if it dies? */
+	boolean_t	zone_reboot_on_init_exit; /* Reboot if init dies? */
 	struct brand	*zone_brand;		/* zone's brand */
 	void 		*zone_brand_data;	/* store brand specific data */
 	id_t		zone_defaultcid;	/* dflt scheduling class id */

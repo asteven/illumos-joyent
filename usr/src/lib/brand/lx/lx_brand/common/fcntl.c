@@ -22,7 +22,7 @@
 /*
  * Copyright 2007 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
- * Copyright 2014 Joyent, Inc.  All rights reserved.
+ * Copyright 2015 Joyent, Inc.  All rights reserved.
  */
 
 #include <sys/types.h>
@@ -116,8 +116,12 @@ lx_fcntl(uintptr_t p1, uintptr_t p2, uintptr_t p3)
 
 	rc = lx_fcntl_com(fd, cmd, arg);
 
-	if (lk)
-		stol_flock(&fl, (struct lx_flock *)p3);
+	if (lk && rc >= 0) {
+		stol_flock(&fl, &lxflk);
+		if (uucopy((void *)&lxflk, (void *)p3,
+		    sizeof (struct lx_flock)) != 0)
+			return (-errno);
+	}
 
 	return (rc);
 }
@@ -145,7 +149,12 @@ lx_fcntl64(uintptr_t p1, uintptr_t p2, uintptr_t p3)
 			return (-errno);
 		ltos_flock(&lxflk, &fl);
 		rc = lx_fcntl_com(fd, cmd, (ulong_t)&fl);
-		stol_flock(&fl, (struct lx_flock *)p3);
+		if (rc >= 0) {
+			stol_flock(&fl, &lxflk);
+			if (uucopy((void *)&lxflk, (void *)p3,
+			    sizeof (struct lx_flock)) != 0)
+				return (-errno);
+		}
 	} else if (cmd == LX_F_GETLK64 || cmd == LX_F_SETLKW64 || \
 	    cmd == LX_F_SETLK64) {
 		if (uucopy((void *)p3, (void *)&lxflk64,
@@ -153,7 +162,12 @@ lx_fcntl64(uintptr_t p1, uintptr_t p2, uintptr_t p3)
 			return (-errno);
 		ltos_flock64(&lxflk64, &fl64);
 		rc = lx_fcntl_com(fd, cmd, (ulong_t)&fl64);
-		stol_flock64(&fl64, (struct lx_flock64 *)p3);
+		if (rc >= 0) {
+			stol_flock64(&fl64, &lxflk64);
+			if (uucopy((void *)&lxflk64, (void *)p3,
+			    sizeof (struct lx_flock64)) != 0)
+				return (-errno);
+		}
 	} else {
 		rc = lx_fcntl_com(fd, cmd, (ulong_t)p3);
 	}
@@ -216,11 +230,20 @@ lx_fcntl_com(int fd, int cmd, ulong_t arg)
 		break;
 
 	case LX_F_SETOWN:
+		if ((int)arg == 1) {
+			/* Setown for the init process uses the real pid. */
+			arg = (ulong_t)zoneinit_pid;
+		}
+
 		rc = fcntl(fd, F_SETOWN, arg);
 		break;
 
 	case LX_F_GETOWN:
 		rc = fcntl(fd, F_GETOWN, arg);
+		if (rc == zoneinit_pid) {
+			/* Getown for the init process returns 1. */
+			rc = 1;
+		}
 		break;
 
 	default:
@@ -361,8 +384,6 @@ lx_fcntl_setfl(int fd, ulong_t arg)
  * flock() applies or removes an advisory lock on the file
  * associated with the file descriptor fd.
  *
- * Stolen verbatim from usr/src/ucblib/libucb/port/sys/flock.c
- *
  * operation is: LX_LOCK_SH, LX_LOCK_EX, LX_LOCK_UN, LX_LOCK_NB
  */
 long
@@ -374,12 +395,12 @@ lx_flock(uintptr_t p1, uintptr_t p2)
 	int			cmd;
 	int			ret;
 
-	/* In non-blocking lock, use F_SETLK for cmd, F_SETLKW otherwise */
 	if (operation & LX_LOCK_NB) {
-		cmd = F_SETLK;
+		cmd = F_FLOCK;
 		operation &= ~LX_LOCK_NB; /* turn off this bit */
-	} else
-		cmd = F_SETLKW;
+	} else {
+		cmd = F_FLOCKW;
+	}
 
 	switch (operation) {
 		case LX_LOCK_UN:
@@ -398,11 +419,10 @@ lx_flock(uintptr_t p1, uintptr_t p2)
 	fl.l_whence = 0;
 	fl.l_start = 0;
 	fl.l_len = 0;
+	fl.l_sysid = 0;
+	fl.l_pid = 0;
 
 	ret = fcntl(fd, cmd, &fl);
-
-	if (ret == -1 && errno == EACCES)
-		return (-EWOULDBLOCK);
 
 	return ((ret == -1) ? -errno : ret);
 }

@@ -26,7 +26,7 @@
 /*	Copyright (c) 1988 AT&T	*/
 /*	  All Rights Reserved  	*/
 /*
- * Copyright (c) 2012, Joyent, Inc.  All rights reserved.
+ * Copyright 2015, Joyent, Inc.  All rights reserved.
  */
 
 #include <sys/types.h>
@@ -69,6 +69,7 @@
 #include <sys/sdt.h>
 #include <sys/brand.h>
 #include <sys/klpd.h>
+#include <sys/random.h>
 
 #include <c2/audit.h>
 
@@ -361,6 +362,8 @@ exec_common(const char *fname, const char **argp, const char **envp,
 	 * pending held signals remain held, so don't clear t_hold.
 	 */
 	mutex_enter(&p->p_lock);
+	DTRACE_PROBE3(oldcontext__set, klwp_t *, lwp,
+	    uintptr_t, lwp->lwp_oldcontext, uintptr_t, 0);
 	lwp->lwp_oldcontext = 0;
 	lwp->lwp_ustack = 0;
 	lwp->lwp_old_stk_ctl = 0;
@@ -1270,6 +1273,22 @@ execmap(struct vnode *vp, caddr_t addr, size_t len, size_t zfodlen,
 			/*
 			 * Before we go to zero the remaining space on the last
 			 * page, make sure we have write permission.
+			 *
+			 * Normal illumos binaries don't even hit the case
+			 * where we have to change permission on the last page
+			 * since their protection is typically either
+			 *    PROT_USER | PROT_WRITE | PROT_READ
+			 * or
+			 *    PROT_ZFOD (same as PROT_ALL).
+			 *
+			 * We need to be careful how we zero-fill the last page
+			 * if the segment protection does not include
+			 * PROT_WRITE. Using as_setprot() can cause the VM
+			 * segment code to call segvn_vpage(), which must
+			 * allocate a page struct for each page in the segment.
+			 * If we have a very large segment, this may fail, so
+			 * we have to check for that, even though we ignore
+			 * other return values from as_setprot.
 			 */
 
 			AS_LOCK_ENTER(as, &as->a_lock, RW_READER);
@@ -1280,8 +1299,11 @@ execmap(struct vnode *vp, caddr_t addr, size_t len, size_t zfodlen,
 			AS_LOCK_EXIT(as, &as->a_lock);
 
 			if (seg != NULL && (zprot & PROT_WRITE) == 0) {
-				(void) as_setprot(as, (caddr_t)end,
-				    zfoddiff - 1, zprot | PROT_WRITE);
+				if (as_setprot(as, (caddr_t)end, zfoddiff - 1,
+				    zprot | PROT_WRITE) == ENOMEM) {
+					error = ENOMEM;
+					goto bad;
+				}
 			}
 
 			if (on_fault(&ljb)) {
@@ -1570,8 +1592,6 @@ stk_copyin(execa_t *uap, uarg_t *args, intpdata_t *intp, void **auxvpp)
 	size_t size, pad;
 	char *argv = (char *)uap->argp;
 	char *envp = (char *)uap->envp;
-	uint32_t rvals;
-	uint8_t *rtp;
 	uint8_t rdata[RANDOM_LEN];
 
 	/*
@@ -1660,22 +1680,9 @@ stk_copyin(execa_t *uap, uarg_t *args, intpdata_t *intp, void **auxvpp)
 
 		/*
 		 * For the AT_RANDOM aux vector we provide 16 bytes of random
-		 * data. However, we don't want to depend on
-		 * kcf_rnd_get_pseudo_bytes for early processes, so just jumble
-		 * some bits from hrtime to get some (pseudo)randomness.
+		 * data.
 		 */
-		rvals = (uint32_t)gethrtime();
-		rtp = (uint8_t *)&rvals;
-		rdata[0] = rdata[11] = *rtp++;
-		rdata[1] = rdata[15] = *rtp++;
-		rdata[2] = rdata[9] = *rtp++;
-		rdata[3] = rdata[12] = *rtp;
-
-		rtp = (uint8_t *)&rvals;
-		rdata[4] = rdata[8] = ~(*rtp++);
-		rdata[5] = rdata[14] = ~(*rtp++);
-		rdata[6] = rdata[13] = ~(*rtp++);
-		rdata[7] = rdata[10] = ~(*rtp);
+		(void) random_get_pseudo_bytes(rdata, sizeof (rdata));
 
 		if ((error = stk_byte_add(args, rdata, sizeof (rdata))) != 0)
 			return (error);
@@ -1912,6 +1919,9 @@ exec_args(execa_t *uap, uarg_t *args, intpdata_t *intp, void **auxvpp)
 		args->stk_align = STACK_ALIGN32;
 		usrstack = (char *)USRSTACK32;
 	}
+
+	if (args->maxstack != 0 && (uintptr_t)usrstack > args->maxstack)
+		usrstack = (char *)args->maxstack;
 
 	ASSERT(P2PHASE((uintptr_t)usrstack, args->stk_align) == 0);
 

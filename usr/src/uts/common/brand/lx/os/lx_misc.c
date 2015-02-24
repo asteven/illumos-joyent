@@ -24,7 +24,7 @@
  */
 
 /*
- * Copyright (c) 2014, Joyent, Inc. All rights reserved.
+ * Copyright (c) 2015, Joyent, Inc. All rights reserved.
  */
 
 #include <sys/errno.h>
@@ -36,6 +36,7 @@
 #include <sys/sem.h>
 #include <sys/brand.h>
 #include <sys/lx_brand.h>
+#include <sys/lx_misc.h>
 #include <sys/lx_pid.h>
 #include <sys/lx_futex.h>
 #include <sys/cmn_err.h>
@@ -46,6 +47,8 @@
 #include <lx_signum.h>
 #include <lx_syscall.h>
 #include <sys/proc.h>
+#include <net/if.h>
+#include <sys/sunddi.h>
 
 /* Linux specific functions and definitions */
 void lx_setrval(klwp_t *, int, int);
@@ -77,7 +80,7 @@ lx_exec()
 	klwp_t *lwp = ttolwp(curthread);
 	struct lx_lwp_data *lwpd = lwptolxlwp(lwp);
 	proc_t *p = ttoproc(curthread);
-	lx_proc_data_t *pd = p->p_brand_data;
+	lx_proc_data_t *pd = ptolxproc(p);
 	int err;
 
 	/*
@@ -85,7 +88,6 @@ lx_exec()
 	 * invalid; clear them.
 	 */
 	pd->l_handler = NULL;
-	pd->l_tracehandler = NULL;
 
 	/*
 	 * There are two mutually exclusive special cases we need to
@@ -110,9 +112,24 @@ lx_exec()
 		lx_pid_reassign(curthread);
 	}
 
+	/*
+	 * Inform ptrace(2) that we are processing an execve(2) call so that if
+	 * we are traced we can post either the PTRACE_EVENT_EXEC event or the
+	 * legacy SIGTRAP.
+	 */
+	(void) lx_ptrace_stop_for_option(LX_PTRACE_O_TRACEEXEC, B_FALSE, 0, 0);
+
 	/* clear the fsbase values until the app. can reinitialize them */
 	lwpd->br_lx_fsbase = NULL;
 	lwpd->br_ntv_fsbase = NULL;
+
+	/*
+	 * Clear the native stack flags.  This will be reinitialised by
+	 * lx_init() in the new process image.
+	 */
+	lwpd->br_stack_mode = LX_STACK_MODE_PREINIT;
+	lwpd->br_ntv_stack = 0;
+	lwpd->br_ntv_stack_current = 0;
 
 	installctx(lwptot(lwp), lwp, lx_save, lx_restore, NULL, NULL, lx_save,
 	    NULL);
@@ -134,14 +151,20 @@ void
 lx_exitlwp(klwp_t *lwp)
 {
 	struct lx_lwp_data *lwpd = lwptolxlwp(lwp);
-	proc_t *p;
+	proc_t *p = lwptoproc(lwp);
 	kthread_t *t;
 	sigqueue_t *sqp = NULL;
 	pid_t ppid;
 	id_t ptid;
 
+	VERIFY(MUTEX_NOT_HELD(&p->p_lock));
+
 	if (lwpd == NULL)
 		return;		/* second time thru' */
+
+	mutex_enter(&p->p_lock);
+	lx_ptrace_exit(p, lwp);
+	mutex_exit(&p->p_lock);
 
 	if (lwpd->br_clear_ctidp != NULL) {
 		(void) suword32(lwpd->br_clear_ctidp, 0);
@@ -220,12 +243,25 @@ lx_freelwp(klwp_t *lwp)
 {
 	struct lx_lwp_data *lwpd = lwptolxlwp(lwp);
 
+	/*
+	 * Remove our system call interposer.
+	 */
+	lwp->lwp_brand_syscall = NULL;
+
 	if (lwpd != NULL) {
 		(void) removectx(lwptot(lwp), lwp, lx_save, lx_restore,
 		    NULL, NULL, lx_save, NULL);
-		if (lwpd->br_pid != 0)
+		if (lwpd->br_pid != 0) {
 			lx_pid_rele(lwptoproc(lwp)->p_pid,
 			    lwptot(lwp)->t_tid);
+		}
+
+		/*
+		 * Ensure that lx_ptrace_exit() has been called to detach
+		 * ptrace(2) tracers and tracees.
+		 */
+		VERIFY(lwpd->br_ptrace_tracer == NULL);
+		VERIFY(lwpd->br_ptrace_accord == NULL);
 
 		lwp->lwp_brand = NULL;
 		kmem_free(lwpd, sizeof (struct lx_lwp_data));
@@ -235,8 +271,8 @@ lx_freelwp(klwp_t *lwp)
 int
 lx_initlwp(klwp_t *lwp)
 {
-	struct lx_lwp_data *lwpd;
-	struct lx_lwp_data *plwpd;
+	lx_lwp_data_t *lwpd;
+	lx_lwp_data_t *plwpd = ttolxlwp(curthread);
 	kthread_t *tp = lwptot(lwp);
 
 	lwpd = kmem_zalloc(sizeof (struct lx_lwp_data), KM_SLEEP);
@@ -245,8 +281,7 @@ lx_initlwp(klwp_t *lwp)
 	lwpd->br_clear_ctidp = NULL;
 	lwpd->br_set_ctidp = NULL;
 	lwpd->br_signal = 0;
-	lwpd->br_ntv_syscall = 1;
-	lwpd->br_scms = 1;
+	lwpd->br_stack_mode = LX_STACK_MODE_PREINIT;
 
 	/*
 	 * lwpd->br_affinitymask was zeroed by kmem_zalloc()
@@ -262,38 +297,13 @@ lx_initlwp(klwp_t *lwp)
 	if (tp->t_next == tp) {
 		lwpd->br_ppid = tp->t_procp->p_ppid;
 		lwpd->br_ptid = -1;
-	} else if (ttolxlwp(curthread) != NULL) {
-		plwpd = ttolxlwp(curthread);
+	} else if (plwpd != NULL) {
 		bcopy(plwpd->br_tls, lwpd->br_tls, sizeof (lwpd->br_tls));
 		lwpd->br_ppid = plwpd->br_pid;
 		lwpd->br_ptid = curthread->t_tid;
 		/* The child inherits the 2 fsbase values from the parent */
 		lwpd->br_lx_fsbase = plwpd->br_lx_fsbase;
 		lwpd->br_ntv_fsbase = plwpd->br_ntv_fsbase;
-
-#if defined(__amd64)
-		pcb_t *pcb = &lwp->lwp_pcb;
-		DTRACE_PROBE2(brand__lx__initlwp,
-		    uintptr_t, pcb->pcb_fsbase,
-		    uintptr_t, rdmsr(MSR_AMD_FSBASE));
-#ifdef DEBUG
-		ulong_t curr_base = rdmsr(MSR_AMD_FSBASE);
-
-		if (curr_base != 0 && lwpd->br_ntv_fsbase != 0 &&
-		    lwpd->br_ntv_fsbase != curr_base) {
-			DTRACE_PROBE2(brand__lx__initlwp__ntv__fsb,
-			    uintptr_t, lwpd->br_lx_fsbase,
-			    uintptr_t, curr_base);
-		}
-
-		if (pcb->pcb_fsbase != 0 && lwpd->br_ntv_fsbase != 0 &&
-		    lwpd->br_ntv_fsbase != pcb->pcb_fsbase) {
-			DTRACE_PROBE2(brand__lx__initlwp__ntv__pcb,
-			    uintptr_t, lwpd->br_ntv_fsbase,
-			    uintptr_t, pcb->pcb_fsbase);
-		}
-#endif
-#endif
 	} else {
 		/*
 		 * Oddball case: the parent thread isn't a Linux process.
@@ -313,6 +323,19 @@ lx_initlwp(klwp_t *lwp)
 	installctx(lwptot(lwp), lwp, lx_save, lx_restore, NULL, NULL,
 	    lx_save, NULL);
 
+	/*
+	 * If the parent LWP has a ptrace(2) tracer, the new LWP may
+	 * need to inherit that same tracer.
+	 */
+	if (plwpd != NULL) {
+		lx_ptrace_inherit_tracer(plwpd, lwpd);
+	}
+
+	/*
+	 * Install branded system call hook for this LWP:
+	 */
+	lwp->lwp_brand_syscall = lx_syscall_enter;
+
 	return (0);
 }
 
@@ -331,6 +354,27 @@ lx_forklwp(klwp_t *srclwp, klwp_t *dstlwp)
 	dst->br_ppid = src->br_pid;
 	dst->br_ptid = lwptot(srclwp)->t_tid;
 	bcopy(src->br_tls, dst->br_tls, sizeof (dst->br_tls));
+
+	switch (src->br_stack_mode) {
+	case LX_STACK_MODE_BRAND:
+	case LX_STACK_MODE_NATIVE:
+		/*
+		 * The parent LWP has an alternate stack installed.
+		 * The child LWP should have the same stack base and extent.
+		 */
+		dst->br_stack_mode = src->br_stack_mode;
+		dst->br_ntv_stack = src->br_ntv_stack;
+		dst->br_ntv_stack_current = src->br_ntv_stack_current;
+		break;
+
+	default:
+		/*
+		 * Otherwise, clear the stack data for this LWP.
+		 */
+		dst->br_stack_mode = LX_STACK_MODE_PREINIT;
+		dst->br_ntv_stack = 0;
+		dst->br_ntv_stack_current = 0;
+	}
 
 	/*
 	 * copy only these flags
@@ -357,6 +401,11 @@ lx_save(klwp_t *t)
 
 /*
  * When switching a Linux process on the CPU, set its GDT entries.
+ *
+ * For 64-bit code we don't have to worry about explicitly setting the
+ * %fsbase via wrmsr(MSR_AMD_FSBASE) here. Instead, that should happen
+ * automatically in update_sregs if we are executing in user-land. If this
+ * is the case then pcb_rupdate should be set.
  */
 static void
 lx_restore(klwp_t *t)
@@ -389,12 +438,6 @@ longlong_t
 lx_nosys()
 {
 	return (set_errno(ENOSYS));
-}
-
-longlong_t
-lx_opnotsupp()
-{
-	return (set_errno(EOPNOTSUPP));
 }
 
 /*
@@ -430,10 +473,27 @@ lx_fixsegreg(greg_t sr, model_t datamodel)
 }
 
 /*
+ * Brand-specific function to convert the fsbase as pulled from the register
+ * into a native fsbase suitable for locating the ulwp_t from the kernel.
+ */
+uintptr_t
+lx_fsbase(klwp_t *lwp, uintptr_t fsbase)
+{
+	lx_lwp_data_t *lwpd = lwp->lwp_brand;
+
+	if (lwpd->br_stack_mode != LX_STACK_MODE_BRAND ||
+	    lwpd->br_ntv_fsbase == NULL) {
+		return (fsbase);
+	}
+
+	return (lwpd->br_ntv_fsbase);
+}
+
+/*
  * These two functions simulate winfo and post_sigcld for the lx brand. The
  * difference is delivering a designated signal as opposed to always SIGCLD.
  */
-void
+static void
 lx_winfo(proc_t *pp, k_siginfo_t *ip, struct lx_proc_data *dat)
 {
 	ASSERT(MUTEX_HELD(&pidlock));
@@ -448,7 +508,7 @@ lx_winfo(proc_t *pp, k_siginfo_t *ip, struct lx_proc_data *dat)
 	ip->si_utime = pp->p_utime;
 }
 
-void
+static void
 lx_post_exit_sig(proc_t *cp, sigqueue_t *sqp, struct lx_proc_data *dat)
 {
 	proc_t *pp = cp->p_parent;
@@ -531,10 +591,7 @@ lx_exit_with_sig(proc_t *cp, sigqueue_t *sqp, void *brand_data)
  *   SIGCHLD         X           -
  *
  * This is an XOR of __WCLONE being set, and SIGCHLD being the signal sent on
- * process exit.  Since (flags & __WCLONE) is not guaranteed to have the
- * least-significant bit set when the flags is enabled, !! is used to place
- * that bit into the least significant bit. Then, the bitwise XOR can be
- * used, because there is no logical XOR in the C language.
+ * process exit.
  *
  * More information on wait in lx brands can be found at
  * usr/src/lib/brand/lx/lx_brand/common/wait.c.
@@ -542,27 +599,58 @@ lx_exit_with_sig(proc_t *cp, sigqueue_t *sqp, void *brand_data)
 boolean_t
 lx_wait_filter(proc_t *pp, proc_t *cp)
 {
-	int flags;
+	lx_lwp_data_t *lwpd = ttolxlwp(curthread);
+	int flags = lwpd->br_waitid_flags;
 	boolean_t ret;
 
-	if (LX_ARGS(waitid) != NULL) {
-		flags = LX_ARGS(waitid)->waitid_flags;
-		mutex_enter(&cp->p_lock);
-		if (flags & LX_WALL) {
-			ret = B_TRUE;
-		} else if (cp->p_stat == SZOMB ||
-		    cp->p_brand == &native_brand) {
-			ret = (((!!(flags & LX_WCLONE)) ^
-			    (stol_signo[SIGCHLD] == cp->p_exit_data))
-			    ? B_TRUE : B_FALSE);
-		} else {
-			ret = (((!!(flags & LX_WCLONE)) ^
-			    (stol_signo[SIGCHLD] == ptolxproc(cp)->l_signal))
-			    ? B_TRUE : B_FALSE);
-		}
-		mutex_exit(&cp->p_lock);
-		return (ret);
-	} else {
+	if (!lwpd->br_waitid_emulate) {
 		return (B_TRUE);
+	}
+
+	mutex_enter(&cp->p_lock);
+	if (flags & LX_WALL) {
+		ret = B_TRUE;
+
+	} else {
+		int exitsig;
+		boolean_t is_clone, _wclone;
+
+		/*
+		 * Determine the exit signal for this process:
+		 */
+		if (cp->p_stat == SZOMB || cp->p_brand == &native_brand) {
+			exitsig = cp->p_exit_data;
+		} else {
+			exitsig = ptolxproc(cp)->l_signal;
+		}
+
+		/*
+		 * To enable the bitwise XOR to stand in for the absent C
+		 * logical XOR, we use the logical NOT operator twice to
+		 * ensure the least significant bit is populated with the
+		 * __WCLONE flag status.
+		 */
+		_wclone = !!(flags & LX_WCLONE);
+		is_clone = (stol_signo[SIGCHLD] == exitsig);
+
+		ret = (_wclone ^ is_clone) ? B_TRUE : B_FALSE;
+	}
+	mutex_exit(&cp->p_lock);
+
+	return (ret);
+}
+
+void
+lx_ifname_convert(char *ifname, int flag)
+{
+	ASSERT(flag == LX_IFNAME_FROMNATIVE ||
+	    flag == LX_IFNAME_TONATIVE);
+
+	if (flag == LX_IFNAME_TONATIVE) {
+		if (strncmp(ifname, "lo", IFNAMSIZ) == 0)
+			(void) strlcpy(ifname, "lo0", IFNAMSIZ);
+	} else if (flag == LX_IFNAME_FROMNATIVE) {
+		if (strncmp(ifname, "lo0", IFNAMSIZ) == 0)
+			(void) strlcpy(ifname, "lo", IFNAMSIZ);
 	}
 }

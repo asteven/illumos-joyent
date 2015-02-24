@@ -21,7 +21,7 @@
 /*
  * Copyright 2006 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
- * Copyright 2014 Joyent, Inc.  All rights reserved.
+ * Copyright 2015 Joyent, Inc.
  */
 
 #include <errno.h>
@@ -49,6 +49,7 @@ int pagesize;	/* needed for mmap2() */
 #define	LX_MAP_ANONYMOUS	0x00020
 #define	LX_MAP_LOCKED		0x02000
 #define	LX_MAP_NORESERVE	0x04000
+#define	LX_MAP_32BIT		0x00040
 
 #define	LX_MADV_REMOVE		9
 #define	LX_MADV_DONTFORK	10
@@ -66,10 +67,16 @@ ltos_mmap_flags(int flags)
 	int new_flags;
 
 	new_flags = flags & (MAP_TYPE | MAP_FIXED);
+
 	if (flags & LX_MAP_ANONYMOUS)
 		new_flags |= MAP_ANONYMOUS;
 	if (flags & LX_MAP_NORESERVE)
 		new_flags |= MAP_NORESERVE;
+
+#if defined(_LP64)
+	if (flags & LX_MAP_32BIT)
+		new_flags |= MAP_32BIT;
+#endif
 
 	return (new_flags);
 }
@@ -86,7 +93,7 @@ mmap_common(uintptr_t p1, uintptr_t p2, uintptr_t p3, uintptr_t p4,
 	off64_t off = p6;
 	void *ret;
 
-	if (lx_debug_enabled != 0) {
+	if (LX_DEBUG_ISENABLED) {
 		char *path, path_buf[MAXPATHLEN];
 
 		path = lx_fd_to_path(fd, path_buf, sizeof (path_buf));
@@ -103,6 +110,21 @@ mmap_common(uintptr_t p1, uintptr_t p2, uintptr_t p3, uintptr_t p4,
 	 */
 	if (flags & LX_MAP_ANONYMOUS)
 		fd = -1;
+
+	/*
+	 * We refuse, as a matter of principle, to overcommit memory.
+	 * Unfortunately, several bits of important and popular software expect
+	 * to be able to pre-allocate large amounts of virtual memory but then
+	 * probably never use it.  One particularly bad example of this
+	 * practice is golang.
+	 *
+	 * In the interest of running software, unsafe or not, we fudge
+	 * something vaguely similar to overcommit by permanently enabling
+	 * MAP_NORESERVE unless MAP_LOCKED was requested:
+	 */
+	if (!(flags & LX_MAP_LOCKED)) {
+		flags |= LX_MAP_NORESERVE;
+	}
 
 	/*
 	 * This is totally insane. The NOTES section in the linux mmap(2) man

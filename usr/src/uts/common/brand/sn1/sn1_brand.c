@@ -21,7 +21,7 @@
 
 /*
  * Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright 2014 Joyent, Inc. All rights reserved.
+ * Copyright 2015 Joyent, Inc. All rights reserved.
  */
 
 #include <sys/errno.h>
@@ -49,7 +49,7 @@ void	sn1_setbrand(proc_t *);
 int	sn1_getattr(zone_t *, int, void *, size_t *);
 int	sn1_setattr(zone_t *, int, void *, size_t);
 int	sn1_brandsys(int, int64_t *, uintptr_t, uintptr_t, uintptr_t,
-		uintptr_t, uintptr_t, uintptr_t);
+		uintptr_t, uintptr_t);
 void	sn1_copy_procdata(proc_t *, proc_t *);
 void	sn1_proc_exit(struct proc *, klwp_t *);
 void	sn1_exec();
@@ -62,28 +62,41 @@ int	sn1_elfexec(vnode_t *, execa_t *, uarg_t *, intpdata_t *, int,
 
 /* sn1 brand */
 struct brand_ops sn1_brops = {
-	sn1_init_brand_data,
-	sn1_free_brand_data,
-	sn1_brandsys,
-	sn1_setbrand,
-	sn1_getattr,
-	sn1_setattr,
-	sn1_copy_procdata,
-	sn1_proc_exit,
-	sn1_exec,
-	lwp_setrval,
-	sn1_initlwp,
-	sn1_forklwp,
-	sn1_freelwp,
-	sn1_lwpexit,
-	sn1_elfexec,
-	NULL,
-	NULL,
-	NULL,
-	NSIG,
-	NULL,
-	NULL,
-	NULL
+	sn1_init_brand_data,		/* b_init_brand_data */
+	sn1_free_brand_data,		/* b_free_brand_data */
+	sn1_brandsys,			/* b_brandsys */
+	sn1_setbrand,			/* b_setbrand */
+	sn1_getattr,			/* b_getattr */
+	sn1_setattr,			/* b_setattr */
+	sn1_copy_procdata,		/* b_copy_procdata */
+	sn1_proc_exit,			/* b_proc_exit */
+	sn1_exec,			/* b_exec */
+	lwp_setrval,			/* b_lwp_setrval */
+	sn1_initlwp,			/* b_initlwp */
+	sn1_forklwp,			/* b_forklwp */
+	sn1_freelwp,			/* b_freelwp */
+	sn1_lwpexit,			/* b_lwpexit */
+	sn1_elfexec,			/* b_elfexec */
+	NULL,				/* b_sigset_native_to_brand */
+	NULL,				/* b_sigset_brand_to_native */
+	NULL,				/* b_psig_to_proc */
+	NSIG,				/* b_nsig */
+	NULL,				/* b_exit_with_sig */
+	NULL,				/* b_wait_filter */
+	NULL,				/* b_native_exec */
+	NULL,				/* b_ptrace_exectrap */
+	NULL,				/* b_map32limit */
+	NULL,				/* b_stop_notify */
+	NULL,				/* b_waitid_helper */
+	NULL,				/* b_sigcld_repost */
+	NULL,				/* b_issig_stop */
+	NULL,				/* b_savecontext */
+#if defined(_SYSCALL32_IMPL)
+	NULL,				/* b_savecontext32 */
+#endif
+	NULL,				/* b_restorecontext */
+	NULL,				/* b_sendsig_stack */
+	NULL				/* b_sendsig */
 };
 
 #ifdef	sparc
@@ -103,6 +116,7 @@ struct brand_mach_ops sn1_mops = {
 	sn1_brand_int91_callback,
 	sn1_brand_syscall_callback,
 	sn1_brand_syscall32_callback,
+	NULL,
 	NULL
 };
 
@@ -113,6 +127,7 @@ struct brand_mach_ops sn1_mops = {
 	NULL,
 	NULL,
 	sn1_brand_syscall_callback,
+	NULL,
 	NULL,
 	NULL
 };
@@ -161,7 +176,7 @@ sn1_setattr(zone_t *zone, int attr, void *buf, size_t bufsize)
 /*ARGSUSED*/
 int
 sn1_brandsys(int cmd, int64_t *rval, uintptr_t arg1, uintptr_t arg2,
-    uintptr_t arg3, uintptr_t arg4, uintptr_t arg5, uintptr_t arg6)
+    uintptr_t arg3, uintptr_t arg4, uintptr_t arg5)
 {
 	int	res;
 
@@ -235,7 +250,7 @@ sn1_elfexec(vnode_t *vp, execa_t *uap, uarg_t *args, intpdata_t *idatap,
 {
 	return (brand_solaris_elfexec(vp, uap, args, idatap, level, execsz,
 	    setid, exec_file, cred, brand_action, &sn1_brand, SN1_BRANDNAME,
-	    SN1_LIB, SN1_LIB32, SN1_LINKER, SN1_LINKER32));
+	    SN1_LIB, SN1_LIB32));
 }
 
 int

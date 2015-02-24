@@ -21,14 +21,16 @@
 #
 # Copyright 2006 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
-# Copyright 2014 Joyent, Inc.  All rights reserved.
+# Copyright 2015 Joyent, Inc.
 #
 
 LX_CMN  =	$(SRC)/common/brand/lx
 
 LIBRARY =	lx_brand.a
 VERS	=	.1
-COBJS	=	clock.o			\
+COBJS	=	aio.o			\
+		capabilities.o		\
+		clock.o			\
 		clone.o			\
 		debug.o			\
 		dir.o			\
@@ -36,7 +38,6 @@ COBJS	=	clock.o			\
 		fcntl.o			\
 		fork.o			\
 		id.o			\
-		ioctl.o			\
 		iovec.o			\
 		lx_brand.o		\
 		lx_thunk_server.o	\
@@ -54,18 +55,19 @@ COBJS	=	clock.o			\
 		sendfile.o		\
 		signal.o		\
 		socket.o		\
+		stack.o			\
 		stat.o			\
 		statfs.o		\
 		sysctl.o		\
 		sysv_ipc.o		\
 		time.o			\
-		truncate.o		\
-		wait.o			\
-		xattr.o
+		truncate.o
 
 CMNOBJS =	lx_signum.o
-ASOBJS	=	lx_handler.o lx_runexe.o lx_crt.o
+ASOBJS	=	lx_handler.o lx_crt.o
 OBJECTS	=	$(CMNOBJS) $(COBJS) $(ASOBJS)
+
+USDT_PROVIDERS =	lx_provider.d
 
 include ../../Makefile.lx
 include ../../../../Makefile.lib
@@ -82,7 +84,7 @@ LDLIBS +=	-lc -lsocket -lmapmalloc -lproc -lrtld_db
 DYNFLAGS +=	$(DYNFLAGS_$(CLASS))
 DYNFLAGS +=	$(BLOCAL) $(ZNOVERSION) -Wl,-e_start -M../common/mapfile
 CFLAGS +=	$(CCVERBOSE)
-CPPFLAGS +=	-D_REENTRANT -I../ -I$(UTSBASE)/common/brand/lx -I$(LX_CMN)
+CPPFLAGS +=	-D_REENTRANT -I. -I../ -I$(UTSBASE)/common/brand/lx -I$(LX_CMN)
 ASFLAGS =	-P $(ASFLAGS_$(CURTYPE)) -D_ASM -I../	\
 			-I$(UTSBASE)/common/brand/lx
 
@@ -93,6 +95,7 @@ all: $(LIBS)
 lint: lintcheck
 
 include ../../../../Makefile.targ
+include ../../../../Makefile.usdt
 
 pics/%.o: $(ISASRCDIR)/%.s
 	$(COMPILE.s) -o $@ $<

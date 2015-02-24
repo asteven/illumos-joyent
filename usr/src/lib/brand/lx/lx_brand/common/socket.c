@@ -22,7 +22,7 @@
 /*
  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
- * Copyright 2014 Joyent, Inc. All rights reserved.
+ * Copyright 2015 Joyent, Inc. All rights reserved.
  */
 
 #include <unistd.h>
@@ -45,6 +45,7 @@
 #include <sys/un.h>
 #include <netinet/tcp.h>
 #include <netinet/igmp.h>
+#include <netinet/icmp6.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/lx_debug.h>
@@ -52,6 +53,7 @@
 #include <sys/lx_socket.h>
 #include <sys/lx_brand.h>
 #include <sys/lx_misc.h>
+#include <netpacket/packet.h>
 
 /*
  * This string is used to prefix all abstract namespace Unix sockets, ie all
@@ -130,17 +132,32 @@ static struct {
  * and Unix networking even more so.
  */
 static const int ltos_family[LX_AF_MAX + 1] =  {
-	AF_UNSPEC, AF_UNIX, AF_INET, AF_CCITT, AF_IPX,
-	AF_APPLETALK, AF_NOTSUPPORTED, AF_OSI, AF_NOTSUPPORTED,
-	AF_X25, AF_INET6, AF_CCITT, AF_DECnet,
-	AF_802, AF_POLICY, AF_KEY, AF_LX_NETLINK,
+	AF_UNSPEC, AF_UNIX, AF_INET, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
 	AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
-	AF_NOTSUPPORTED, AF_SNA, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
+	AF_NOTSUPPORTED, AF_INET6, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
+	AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_LX_NETLINK,
+	AF_PACKET, AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
+	AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
 	AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
 	AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED
 };
 
+#define	LX_AF_INET6	10
+#define	LX_AF_PACKET	17
+
+static const int stol_family[LX_AF_MAX + 1] =  {
+	AF_UNSPEC, AF_UNIX, AF_INET, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
+	AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
+	AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
+	AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_LX_NETLINK,
+	AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
+	AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
+	AF_NOTSUPPORTED, LX_AF_INET6, AF_NOTSUPPORTED, AF_NOTSUPPORTED,
+	AF_NOTSUPPORTED, AF_NOTSUPPORTED, AF_NOTSUPPORTED, LX_AF_PACKET
+};
+
 #define	LTOS_FAMILY(d) ((d) <= LX_AF_MAX ? ltos_family[(d)] : AF_INVAL)
+#define	STOL_FAMILY(d) ((d) <= LX_AF_MAX ? stol_family[(d)] : AF_INVAL)
 
 static const int ltos_socktype[LX_SOCK_PACKET + 1] = {
 	SOCK_NOTSUPPORTED, SOCK_STREAM, SOCK_DGRAM, SOCK_RAW,
@@ -244,6 +261,85 @@ static const int ltos_ip_sockopts[LX_IP_UNICAST_IF + 1] = {
 };
 
 /*
+ * Linux			Illumos
+ * -----			-------
+ *
+ * IPV6_ADDRFORM	1
+ * IPV6_2292PKTINFO	2
+ * IPV6_2292HOPOPTS	3
+ * IPV6_2292DSTOPTS	4
+ * IPV6_2292RTHDR	5
+ * IPV6_2292PKTOPTIONS	6
+ * IPV6_CHECKSUM	7	IPV6_CHECKSUM  0x18
+ * IPV6_2292HOPLIMIT	8
+ * IPV6_NEXTHOP		9
+ * IPV6_AUTHHDR		10
+ * IPV6_UNICAST_HOPS	16	IPV6_UNICAST_HOPS  0x5
+ * IPV6_MULTICAST_IF	17	IPV6_MULTICAST_IF  0x6
+ * IPV6_MULTICAST_HOPS	18	IPV6_MULTICAST_HOPS  0x7
+ * IPV6_MULTICAST_LOOP	19	IPV6_MULTICAST_LOOP  0x8
+ * IPV6_JOIN_GROUP	20
+ * IPV6_LEAVE_GROUP	21
+ * IPV6_ROUTER_ALERT	22
+ * IPV6_MTU_DISCOVER	23
+ * IPV6_MTU		24	(discarded)
+ * IPV6_RECVERR		25
+ * IPV6_V6ONLY		26	IPV6_V6ONLY  0x27
+ * IPV6_JOIN_ANYCAST	27
+ * IPV6_LEAVE_ANYCAST	28
+ * IPV6_IPSEC_POLICY	34
+ * IPV6_XFRM_POLICY	35
+ *
+ * IPV6_RECVPKTINFO	49	IPV6_RECVPKTINFO  0x12
+ * IPV6_PKTINFO		50	IPV6_PKTINFO  0xb
+ * IPV6_RECVHOPLIMIT	51	IPV6_RECVHOPLIMIT  0x13
+ * IPV6_HOPLIMIT	52	IPV6_HOPLIMIT  0xc
+ * IPV6_RECVHOPOPTS	53
+ * IPV6_HOPOPTS		54
+ * IPV6_RTHDRDSTOPTS	55
+ * IPV6_RECVRTHDR	56
+ * IPV6_RTHDR		57
+ * IPV6_RECVDSTOPTS	58
+ * IPV6_DSTOPTS		59
+ * IPV6_RECVTCLASS	66
+ * IPV6_TCLASS		67	IPV6_TCLASS  0x26
+ */
+
+
+static const int ltos_ipv6_sockopts[LX_IPV6_TCLASS + 1] = {
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 3 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, IPV6_CHECKSUM,		/* 7 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 11 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 15 */
+	IPV6_UNICAST_HOPS, IPV6_MULTICAST_IF,			/* 17 */
+	IPV6_MULTICAST_HOPS, IPV6_MULTICAST_LOOP,		/* 19 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 23 */
+	OPTNOTSUP, OPTNOTSUP, IPV6_V6ONLY, OPTNOTSUP,		/* 27 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 31 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 35 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 39 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 43 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 47 */
+	OPTNOTSUP, IPV6_RECVPKTINFO,				/* 49 */
+	IPV6_PKTINFO, IPV6_RECVHOPLIMIT,			/* 51 */
+	IPV6_HOPLIMIT, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 55 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 59 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,		/* 63 */
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, IPV6_TCLASS,		/* 67 */
+};
+
+/*
+ * Linux			Illumos
+ * -----			-------
+ *
+ * ICMP6_FILTER	1		ICMP6_FILTER	1
+ */
+
+static const int ltos_icmpv6_sockopts[LX_ICMP6_FILTER + 1] = {
+	OPTNOTSUP, ICMP6_FILTER
+};
+
+/*
  *
  * TCP socket option mapping:
  *
@@ -334,8 +430,8 @@ static const int ltos_igmp_sockopts[IGMP_MTRACE + 1] = {
  * SO_TIMESTAMP          29		SO_TIMESTAMP    0x1013
  * SO_ACCEPTCONN         30		SO_ACCEPTCONN   0x0002
  * SO_PEERSEC            31
- * SO_SNDBUFFORCE        32
- * SO_RCVBUFFORCE        33
+ * SO_SNDBUFFORCE        32		SO_SNDBUF (FORCE is a lie)
+ * SO_RCVBUFFORCE        33		SO_RCVBUF (FORCE is a lie)
  * SO_PASSSEC            34
  * SO_TIMESTAMPNS        35
  * SO_MARK               36
@@ -361,7 +457,7 @@ static const int ltos_socket_sockopts[LX_SO_BPF_EXTENSIONS + 1] = {
 	SO_RCVTIMEO,	SO_SNDTIMEO,	OPTNOTSUP,	OPTNOTSUP,	/* 23 */
 	OPTNOTSUP,	OPTNOTSUP, SO_ATTACH_FILTER, SO_DETACH_FILTER,	/* 27 */
 	OPTNOTSUP,	SO_TIMESTAMP,	SO_ACCEPTCONN,	OPTNOTSUP,	/* 31 */
-	OPTNOTSUP,	OPTNOTSUP,	OPTNOTSUP,	OPTNOTSUP,	/* 35 */
+	SO_SNDBUF,	SO_RCVBUF,	OPTNOTSUP,	OPTNOTSUP,	/* 35 */
 	OPTNOTSUP,	OPTNOTSUP,	SO_PROTOTYPE,	SO_DOMAIN,	/* 39 */
 	OPTNOTSUP,	OPTNOTSUP,	OPTNOTSUP,	OPTNOTSUP,	/* 43 */
 	OPTNOTSUP,	OPTNOTSUP,	OPTNOTSUP,	OPTNOTSUP,	/* 47 */
@@ -372,8 +468,25 @@ static const int ltos_socket_sockopts[LX_SO_BPF_EXTENSIONS + 1] = {
  * See the Linux raw.7 man page for description of the socket options.
  *    In Linux ICMP_FILTER is defined as 1 in include/uapi/linux/icmp.h
  */
-static const int ltos_raw_sockopts[LX_ICMP_FILTER + 1] = {
-	OPTNOTSUP, OPTNOTSUP
+static const int ltos_raw_sockopts[LX_IPV6_CHECKSUM + 1] = {
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP,
+	OPTNOTSUP, OPTNOTSUP, OPTNOTSUP, OPTNOTSUP
+};
+
+/*
+ * PF_PACKET sockopts
+ * Linux				Illumos
+ * -----				-------
+ * PACKET_ADD_MEMBERSHIP	1	PACKET_ADD_MEMBERSHIP	0x2
+ * PACKET_DROP_MEMBERSHIP	2	PACKET_DROP_MEMBERSHIP	0x3
+ * PACKET_RECV_OUTPUT		3
+ * PACKET_RX_RING		5
+ * PACKET_STATISTICS		6	PACKET_STATISTICS	0x5
+ */
+
+static const int ltos_packet_sockopts[LX_PACKET_STATISTICS + 1] = {
+	OPTNOTSUP, PACKET_ADD_MEMBERSHIP, PACKET_DROP_MEMBERSHIP, OPTNOTSUP,
+	OPTNOTSUP, OPTNOTSUP, PACKET_STATISTICS
 };
 
 #define	PROTO_SOCKOPTS(opts)    \
@@ -383,11 +496,23 @@ static const int ltos_raw_sockopts[LX_ICMP_FILTER + 1] = {
  * [gs]etsockopt options mapping tables
  */
 static lx_proto_opts_t ip_sockopts_tbl = PROTO_SOCKOPTS(ltos_ip_sockopts);
+static lx_proto_opts_t ipv6_sockopts_tbl = PROTO_SOCKOPTS(ltos_ipv6_sockopts);
+static lx_proto_opts_t icmpv6_sockopts_tbl =
+    PROTO_SOCKOPTS(ltos_icmpv6_sockopts);
 static lx_proto_opts_t socket_sockopts_tbl =
     PROTO_SOCKOPTS(ltos_socket_sockopts);
 static lx_proto_opts_t igmp_sockopts_tbl = PROTO_SOCKOPTS(ltos_igmp_sockopts);
 static lx_proto_opts_t tcp_sockopts_tbl = PROTO_SOCKOPTS(ltos_tcp_sockopts);
 static lx_proto_opts_t raw_sockopts_tbl = PROTO_SOCKOPTS(ltos_raw_sockopts);
+static lx_proto_opts_t packet_sockopts_tbl =
+    PROTO_SOCKOPTS(ltos_packet_sockopts);
+
+
+/* Needed for SO_ATTACH_FILTER */
+struct lx_bpf_program {
+    unsigned short bf_len;
+    caddr_t bf_insns;
+};
 
 /*
  * Lifted from socket.h, since these definitions are contained within
@@ -432,6 +557,15 @@ typedef struct {
 	uint32_t	nl_pid;
 	uint32_t	nl_groups;
 } lx_sockaddr_nl_t;
+
+typedef struct {
+	sa_family_t	sin6_family;
+	in_port_t	sin6_port;
+	uint32_t	sin6_flowinfo;
+	struct in6_addr	sin6_addr;
+	uint32_t	sin6_scope_id;  /* Depends on scope of sin6_addr */
+	/* one 32-bit field shorter than illumos */
+} lx_sockaddr_in6_t;
 
 #if defined(_LP64)
 /*
@@ -514,14 +648,28 @@ ltos_xform_cmsgs(struct lx_msghdr *msg, struct cmsghdr *ntv_cmsg)
 static int
 stol_xform_cmsgs(struct lx_msghdr *msg, lx_cmsghdr64_t *lx_cmsg)
 {
+	struct lx_msghdr tmsg;
 	lx_cmsghdr64_t *lcmsg, *last;
 	struct cmsghdr *cmsg, *lp;
 	int nlen = 0;
 	int err = 0;
 
-	lcmsg = lx_cmsg;
+	/*
+	 * Create a temporary "struct lx_msghdr" so that we can use the
+	 * LX_CMSG_*HDR() iteration macros.
+	 */
+	tmsg = *msg;
+	tmsg.msg_control = lx_cmsg;
+	tmsg.msg_controllen = msg->msg_controllen + LX_CMSG_EXTRA;
+
+	lcmsg = LX_CMSG_FIRSTHDR(&tmsg);
 	cmsg = CMSG_FIRSTHDR(msg);
 	while (cmsg != NULL && err == 0) {
+		if (lcmsg == NULL) {
+			err = ENOTSUP;
+			break;
+		}
+
 		lcmsg->cmsg_len =
 		    LX_CMSG_LEN(cmsg->cmsg_len - sizeof (struct cmsghdr));
 		lcmsg->cmsg_level = cmsg->cmsg_level;
@@ -534,12 +682,13 @@ stol_xform_cmsgs(struct lx_msghdr *msg, lx_cmsghdr64_t *lx_cmsg)
 		cmsg = CMSG_NXTHDR(msg, lp);
 
 		last = lcmsg;
-		lcmsg = LX_CMSG_NXTHDR(msg, last);
+		lcmsg = LX_CMSG_NXTHDR(&tmsg, last);
 
 		nlen += (int)((uint64_t)lcmsg - (uint64_t)last);
 
-		if (nlen > (msg->msg_controllen + LX_CMSG_EXTRA))
+		if (nlen > (msg->msg_controllen + LX_CMSG_EXTRA)) {
 			err = ENOTSUP;
+		}
 	}
 
 	if (err) {
@@ -584,6 +733,10 @@ convert_cmsgs(int direction, struct lx_msghdr *msg, void *new_cmsg,
 					cmsg->cmsg_type = SCM_TIMESTAMP;
 				else
 					err = ENOTSUP;
+			} else if (cmsg->cmsg_level == LX_IPPROTO_IPV6) {
+				if (cmsg->cmsg_type == LX_IPV6_PKTINFO) {
+					cmsg->cmsg_type = IPV6_PKTINFO;
+				}
 			} else {
 				err = ENOTSUP;
 			}
@@ -598,6 +751,10 @@ convert_cmsgs(int direction, struct lx_msghdr *msg, void *new_cmsg,
 					cmsg->cmsg_type = LX_SCM_TIMESTAMP;
 				else
 					err = ENOTSUP;
+			} else if (cmsg->cmsg_level == IPPROTO_IPV6) {
+				if (cmsg->cmsg_type == IPV6_PKTINFO) {
+					cmsg->cmsg_type = LX_IPV6_PKTINFO;
+				}
 			} else {
 				err = ENOTSUP;
 			}
@@ -626,14 +783,22 @@ static int
 calc_addr_size(struct sockaddr *a, int nlen, lx_addr_type_t *type)
 {
 	struct sockaddr name;
+	sa_family_t family;
 	size_t fsize = sizeof (name.sa_family);
 
 	if (uucopy(a, &name, sizeof (struct sockaddr)) != 0)
 		return (-errno);
+	family = LTOS_FAMILY(name.sa_family);
 
-	if (name.sa_family != AF_UNIX) {
+	if (family != AF_UNIX) {
 		*type = lxa_none;
-		return (nlen);
+
+		if (family == AF_INET6)
+			return (sizeof (struct sockaddr_in6));
+		else if (nlen < sizeof (struct sockaddr))
+			return (sizeof (struct sockaddr));
+		else
+			return (nlen);
 	}
 
 	/*
@@ -658,6 +823,26 @@ calc_addr_size(struct sockaddr *a, int nlen, lx_addr_type_t *type)
 	return (nlen);
 }
 
+static int
+convert_pkt_proto(int protocol)
+{
+	switch (ntohs(protocol)) {
+	case LX_ETH_P_802_2:
+		return (ETH_P_802_2);
+	case LX_ETH_P_IP:
+		return (ETH_P_IP);
+	case LX_ETH_P_ARP:
+		return (ETH_P_ARP);
+	case LX_ETH_P_IPV6:
+		return (ETH_P_IPV6);
+	case LX_ETH_P_ALL:
+	case LX_ETH_P_802_3:
+		return (ETH_P_ALL);
+	default:
+		return (-1);
+	}
+}
+
 /*
  * If inaddr is an abstract namespace Unix socket, this function expects addr
  * to have enough memory to hold the expanded socket name, ie it must be of
@@ -665,11 +850,12 @@ calc_addr_size(struct sockaddr *a, int nlen, lx_addr_type_t *type)
  * addr to have enough memory to hold an Unix socket address.
  */
 static int
-convert_sockaddr(struct sockaddr *addr, socklen_t *len,
-	struct sockaddr *inaddr, socklen_t inlen, lx_addr_type_t type)
+ltos_sockaddr(struct sockaddr *addr, socklen_t *len,
+    struct sockaddr *inaddr, socklen_t inlen, lx_addr_type_t type)
 {
 	sa_family_t family;
-	int lx_in6_len;
+	struct sockaddr_ll *sll;
+	int proto;
 	int size;
 	int i, orig_len;
 
@@ -705,17 +891,14 @@ convert_sockaddr(struct sockaddr *addr, socklen_t *len,
 
 		case AF_INET6:
 			/*
-			 * The Solaris sockaddr_in6 has one more 32-bit
-			 * field than the Linux version.
+			 * The illumos sockaddr_in6 has one more 32-bit field
+			 * than the Linux version.  We assume the caller has
+			 * zeroed the sockaddr we're copying into.
 			 */
-			size = sizeof (struct sockaddr_in6);
-			lx_in6_len = size - sizeof (uint32_t);
-
-			if (inlen != lx_in6_len)
+			if (inlen != sizeof (lx_sockaddr_in6_t))
 				return (-EINVAL);
 
-			*len = (sizeof (struct sockaddr_in6));
-			bzero((char *)addr + lx_in6_len, sizeof	(uint32_t));
+			*len = sizeof (struct sockaddr_in6);
 			break;
 
 		case AF_UNIX:
@@ -797,6 +980,14 @@ convert_sockaddr(struct sockaddr *addr, socklen_t *len,
 			}
 			break;
 
+		case AF_PACKET:
+			sll = (struct sockaddr_ll *)addr;
+			if ((proto = convert_pkt_proto(sll->sll_protocol)) < 0)
+				return (-EINVAL);
+			sll->sll_protocol = proto;
+			*len = inlen;
+			break;
+
 		default:
 			*len = inlen;
 	}
@@ -806,8 +997,67 @@ convert_sockaddr(struct sockaddr *addr, socklen_t *len,
 }
 
 static int
+stol_sockaddr(struct sockaddr *addr, socklen_t *len,
+    struct sockaddr *inaddr, socklen_t inlen, socklen_t orig)
+{
+	struct sockaddr_in6 stemp;
+	int size = inlen;
+
+	switch (inaddr->sa_family) {
+	case AF_INET:
+		if (inlen > sizeof (struct sockaddr))
+			return (EINVAL);
+		break;
+
+	case AF_INET6:
+		if (inlen != sizeof (struct sockaddr_in6))
+			return (EINVAL);
+		size = (sizeof (lx_sockaddr_in6_t));
+
+		if (uucopy(inaddr, &stemp, inlen) < 0)
+			return (errno);
+		/*
+		 * AF_INET6 is different between Linux/illumos.
+		 * Perform this translation in a temporary sockaddr.
+		 */
+		stemp.sin6_family = STOL_FAMILY(stemp.sin6_family);
+		inaddr = (struct sockaddr *)&stemp;
+		inlen = sizeof (lx_sockaddr_in6_t);
+		break;
+
+	case AF_UNIX:
+		if (inlen > sizeof (struct sockaddr_un))
+			return (EINVAL);
+		/*
+		 * If inlen is larger than orig, copy out the maximum amount of
+		 * data possible and then update *len to indicate the actual
+		 * size of all the data that it wanted to copy out.
+		 */
+		size = (orig > 0 && orig < size) ? orig : size;
+		break;
+
+	case (sa_family_t)AF_NOTSUPPORTED:
+		return (EPROTONOSUPPORT);
+
+	case (sa_family_t)AF_INVAL:
+		return (EAFNOSUPPORT);
+
+	default:
+		break;
+	}
+
+	if (uucopy(inaddr, addr, size) < 0)
+		return (errno);
+
+	if (uucopy(&inlen, len, sizeof (socklen_t)) < 0)
+		return (errno);
+
+	return (0);
+}
+
+static int
 convert_sock_args(int in_dom, int in_type, int in_protocol, int *out_dom,
-    int *out_type, int *out_options)
+    int *out_type, int *out_options, int *out_protocol)
 {
 	int domain, type, options;
 
@@ -828,7 +1078,7 @@ convert_sock_args(int in_dom, int in_type, int in_protocol, int *out_dom,
 
 	/*
 	 * Linux does not allow the app to specify IP Protocol for raw
-	 * sockets.  Solaris does, so bail out here.
+	 * sockets.  Illumos does, so bail out here.
 	 */
 	if (domain == AF_INET && type == SOCK_RAW && in_protocol == IPPROTO_IP)
 		return (-ESOCKTNOSUPPORT);
@@ -839,34 +1089,43 @@ convert_sock_args(int in_dom, int in_type, int in_protocol, int *out_dom,
 	if (in_type & LX_SOCK_CLOEXEC)
 		options |= SOCK_CLOEXEC;
 
+	/*
+	 * The protocol definitions for PF_PACKET differ between Linux and
+	 * illumos.
+	 */
+	if (domain == PF_PACKET &&
+	    (in_protocol = convert_pkt_proto(in_protocol)) < 0)
+		return (EINVAL);
+
 	*out_dom = domain;
 	*out_type = type;
 	*out_options = options;
+	*out_protocol = in_protocol;
 	return (0);
 }
 
 static int
 convert_sockflags(int lx_flags, char *call)
 {
-	int solaris_flags = 0;
+	int native_flags = 0;
 
 	if (lx_flags & LX_MSG_OOB) {
-		solaris_flags |= MSG_OOB;
+		native_flags |= MSG_OOB;
 		lx_flags &= ~LX_MSG_OOB;
 	}
 
 	if (lx_flags & LX_MSG_PEEK) {
-		solaris_flags |= MSG_PEEK;
+		native_flags |= MSG_PEEK;
 		lx_flags &= ~LX_MSG_PEEK;
 	}
 
 	if (lx_flags & LX_MSG_DONTROUTE) {
-		solaris_flags |= MSG_DONTROUTE;
+		native_flags |= MSG_DONTROUTE;
 		lx_flags &= ~LX_MSG_DONTROUTE;
 	}
 
 	if (lx_flags & LX_MSG_CTRUNC) {
-		solaris_flags |= MSG_CTRUNC;
+		native_flags |= MSG_CTRUNC;
 		lx_flags &= ~LX_MSG_CTRUNC;
 	}
 
@@ -876,22 +1135,22 @@ convert_sockflags(int lx_flags, char *call)
 	}
 
 	if (lx_flags & LX_MSG_TRUNC) {
-		solaris_flags |= MSG_TRUNC;
+		native_flags |= MSG_TRUNC;
 		lx_flags &= ~LX_MSG_TRUNC;
 	}
 
 	if (lx_flags & LX_MSG_DONTWAIT) {
-		solaris_flags |= MSG_DONTWAIT;
+		native_flags |= MSG_DONTWAIT;
 		lx_flags &= ~LX_MSG_DONTWAIT;
 	}
 
 	if (lx_flags & LX_MSG_EOR) {
-		solaris_flags |= MSG_EOR;
+		native_flags |= MSG_EOR;
 		lx_flags &= ~LX_MSG_EOR;
 	}
 
 	if (lx_flags & LX_MSG_WAITALL) {
-		solaris_flags |= MSG_WAITALL;
+		native_flags |= MSG_WAITALL;
 		lx_flags &= ~LX_MSG_WAITALL;
 	}
 
@@ -956,7 +1215,7 @@ convert_sockflags(int lx_flags, char *call)
 		lx_unsupported("%s: unknown socket flag(s) 0x%x", call,
 		    lx_flags);
 
-	return (solaris_flags);
+	return (native_flags);
 }
 
 long
@@ -967,7 +1226,7 @@ lx_socket(int domain, int type, int protocol)
 	int err;
 
 	err = convert_sock_args(domain, type, protocol,
-	    &domain, &type, &options);
+	    &domain, &type, &options, &protocol);
 	if (err != 0)
 		return (err);
 
@@ -1000,8 +1259,9 @@ lx_bind(int sockfd, void *np, int nl)
 
 	if ((name = SAFE_ALLOCA(nlen)) == NULL)
 		return (-EINVAL);
+	bzero(name, nlen);
 
-	if ((r = convert_sockaddr(name, &len, np, nl, type)) < 0)
+	if ((r = ltos_sockaddr(name, &len, np, nl, type)) < 0)
 		return (r);
 
 	/*
@@ -1009,10 +1269,10 @@ lx_bind(int sockfd, void *np, int nl)
 	 * do some special handling with respect to bind:  abstract namespace
 	 * sockets and /dev/log.  Abstract namespace sockets are simply Unix
 	 * domain sockets that do not exist on the filesystem; we emulate them
-	 * by changing their paths in convert_sockaddr() to point to real
+	 * by changing their paths in ltos_sockaddr() to point to real
 	 * file names in the  filesystem.  /dev/log is a special Unix domain
 	 * socket that is used for system logging.  On us, /dev isn't writable,
-	 * so we rewrite these sockets in convert_sockaddr() to point to a
+	 * so we rewrite these sockets in ltos_sockaddr() to point to a
 	 * writable file (defined by LX_DEV_LOG_REDIRECT).  In both cases, we
 	 * introduce a new problem with respect to cleanup:  abstract namespace
 	 * sockets don't need to be cleaned up (when they are closed they are
@@ -1080,8 +1340,9 @@ lx_connect(int sockfd, void *np, int nl)
 
 	if ((name = SAFE_ALLOCA(nlen)) == NULL)
 		return (-EINVAL);
+	bzero(name, nlen);
 
-	if ((r = convert_sockaddr(name, &len, np, nl, type)) < 0)
+	if ((r = ltos_sockaddr(name, &len, np, nl, type)) < 0)
 		return (r);
 
 	lx_debug("\tconnect(%d, 0x%p, %d)", sockfd, name, len);
@@ -1108,8 +1369,10 @@ lx_listen(int sockfd, int backlog)
 long
 lx_accept(int sockfd, void *name, int *nlp)
 {
-	socklen_t namelen = 0;
-	int r;
+	socklen_t namelen = 0, origlen;
+	struct sockaddr *saddr;
+	int r, err;
+	int size;
 
 	lx_debug("\taccept(%d, 0x%p, 0x%p", sockfd, (struct sockaddr *)name,
 	    nlp);
@@ -1126,16 +1389,36 @@ lx_accept(int sockfd, void *name, int *nlp)
 	 * If it is NULL, we don't care about the namelen pointer's value
 	 * or about dereferencing it.
 	 *
-	 * Happily, Solaris' accept(3SOCKET) treats NULL name pointers and
+	 * Happily, illumos' accept(3SOCKET) treats NULL name pointers and
 	 * zero namelens the same way.
 	 */
 	if ((name != NULL) &&
 	    (uucopy((void *)nlp, &namelen, sizeof (socklen_t)) != 0))
 		return ((errno == EFAULT) ? -EINVAL : -errno);
+	origlen = namelen;
+
+	if (name != NULL) {
+		/*
+		 * Use sizeof (struct sockaddr_in6) as the minimum temporary
+		 * name allocation.  This will allow families such as AF_INET6
+		 * to work properly when their namelen differs between LX and
+		 * illumos.
+		 */
+		size = sizeof (struct sockaddr_in6);
+		if (namelen > size)
+			size = namelen;
+
+		saddr = SAFE_ALLOCA(size);
+		if (saddr == NULL)
+			return (-EINVAL);
+		bzero(saddr, size);
+	} else {
+		saddr = NULL;
+	}
 
 	lx_debug("\taccept namelen = %d", namelen);
 
-	if ((r = accept(sockfd, (struct sockaddr *)name, &namelen)) < 0)
+	if ((r = accept(sockfd, saddr, &namelen)) < 0)
 		return ((errno == EFAULT) ? -EINVAL : -errno);
 
 	lx_debug("\taccept namelen returned %d bytes", namelen);
@@ -1158,9 +1441,14 @@ lx_accept(int sockfd, void *name, int *nlp)
 	 * out. However, testing shows Linux does indeed fail the call after
 	 * accepting the connection so we must behave in a compatible manner.
 	 */
-	if ((name != NULL) && (namelen != 0) &&
-	    (uucopy(&namelen, (void *)nlp, sizeof (socklen_t)) != 0))
-		return ((errno == EFAULT) ? -EINVAL : -errno);
+	if ((name != NULL) && (namelen != 0)) {
+		err = stol_sockaddr((struct sockaddr *)name, (socklen_t *)nlp,
+		    saddr, namelen, origlen);
+		if (err != 0) {
+			close(r);
+			return ((err == EFAULT) ? -EINVAL : -err);
+		}
+	}
 
 	return (r);
 }
@@ -1170,6 +1458,8 @@ lx_getsockname(int sockfd, void *np, int *nlp)
 {
 	struct sockaddr *name = NULL;
 	socklen_t namelen, namelen_orig;
+	struct stat sb;
+	int err;
 
 	if (uucopy((void *)nlp, &namelen, sizeof (socklen_t)) != 0)
 		return (-errno);
@@ -1178,11 +1468,23 @@ lx_getsockname(int sockfd, void *np, int *nlp)
 	lx_debug("\tgetsockname(%d, 0x%p, 0x%p (=%d))", sockfd,
 	    (struct sockaddr *)np, nlp, namelen);
 
-	if (namelen > 0) {
-		if ((name = SAFE_ALLOCA(namelen)) == NULL)
-			return (-EINVAL);
-		bzero(name, namelen);
-	}
+	if (fstat(sockfd, &sb) == 0 && !S_ISSOCK(sb.st_mode))
+		return (-ENOTSOCK);
+
+	/*
+	 * Use sizeof (struct sockaddr_in6) as the minimum temporary
+	 * name allocation.  This will allow families such as AF_INET6
+	 * to work properly when their namelen differs between LX and
+	 * illumos.
+	 */
+	if (namelen <= 0)
+		return (-EBADF);
+	else if (namelen < sizeof (struct sockaddr_in6))
+		namelen = sizeof (struct sockaddr_in6);
+
+	if ((name = SAFE_ALLOCA(namelen)) == NULL)
+		return (-ENOMEM);
+	bzero(name, namelen);
 
 	if (getsockname(sockfd, name, &namelen) < 0)
 		return (-errno);
@@ -1193,22 +1495,21 @@ lx_getsockname(int sockfd, void *np, int *nlp)
 	 * of data possible and then update namelen to indicate the
 	 * actually size of all the data that it wanted to copy out.
 	 */
-	if (uucopy(name, np, namelen_orig) != 0)
-		return (-errno);
-	if (uucopy(&namelen, (void *)nlp, sizeof (socklen_t)) != 0)
-		return (-errno);
-
-	return (0);
+	err = stol_sockaddr((struct sockaddr *)np, (socklen_t *)nlp, name,
+	    namelen, namelen_orig);
+	return ((err != 0) ? -err : 0);
 }
 
 long
 lx_getpeername(int sockfd, void *np, int *nlp)
 {
 	struct sockaddr *name;
-	socklen_t namelen;
+	socklen_t namelen, namelen_orig;
+	int err;
 
 	if (uucopy((void *)nlp, &namelen, sizeof (socklen_t)) != 0)
 		return (-errno);
+	namelen_orig = namelen;
 
 	lx_debug("\tgetpeername(%d, 0x%p, 0x%p (=%d))", sockfd,
 	    (struct sockaddr *)np, nlp, namelen);
@@ -1227,16 +1528,27 @@ lx_getpeername(int sockfd, void *np, int *nlp)
 	if (np == NULL || np == (void *)-1)
 		return (-EFAULT);
 
-	if ((name = SAFE_ALLOCA(namelen)) == NULL)
+	/*
+	 * Use sizeof (struct sockaddr_in6) as the minimum temporary
+	 * name allocation.  This will allow families such as AF_INET6
+	 * to work properly when their namelen differs between LX and
+	 * illumos.
+	 */
+	if (namelen < sizeof (struct sockaddr_in6))
+		namelen = sizeof (struct sockaddr_in6);
+
+	name = SAFE_ALLOCA(namelen);
+	if (name == NULL)
 		return (-EINVAL);
+	bzero(name, namelen);
+
 	if ((getpeername(sockfd, name, &namelen)) < 0)
 		return (-errno);
 
-	if (uucopy(name, np, namelen) != 0)
-		return (-errno);
-
-	if (uucopy(&namelen, (void *)nlp, sizeof (socklen_t)) != 0)
-		return (-errno);
+	err = stol_sockaddr((struct sockaddr *)np, (socklen_t *)nlp,
+	    name, namelen, namelen_orig);
+	if (err != 0)
+		return (-err);
 
 	return (0);
 }
@@ -1248,7 +1560,8 @@ lx_socketpair(int domain, int type, int protocol, int *sv)
 	int fds[2];
 	int r;
 
-	r = convert_sock_args(domain, type, protocol, &domain, &type, &options);
+	r = convert_sock_args(domain, type, protocol, &domain, &type, &options,
+	    &protocol);
 	if (r != 0)
 		return (r);
 
@@ -1293,8 +1606,9 @@ lx_sendto(int sockfd, void *buf, size_t len, int flags, void *lto, int tolen)
 
 		if ((to = SAFE_ALLOCA(nlen)) == NULL)
 			return (-EINVAL);
+		bzero(to, nlen);
 
-		if ((r = convert_sockaddr(to, &tlen, lto, tlen, type)) < 0)
+		if ((r = ltos_sockaddr(to, &tlen, lto, tlen, type)) < 0)
 			return (r);
 	}
 
@@ -1324,7 +1638,7 @@ lx_sendto(int sockfd, void *buf, size_t len, int flags, void *lto, int tolen)
 			    "emulate LX_MSG_NOSIGNAL");
 	}
 
-	r = sendto(sockfd, buf, len, flags, to, tolen);
+	r = sendto(sockfd, buf, len, flags, to, tlen);
 
 	if ((nosigpipe) && (sigaction(SIGPIPE, &oact, NULL) < 0))
 		lx_err_fatal("sendto(): could not reset SIGPIPE handler to "
@@ -1345,9 +1659,14 @@ lx_sendto(int sockfd, void *buf, size_t len, int flags, void *lto, int tolen)
 
 long
 lx_recvfrom(int sockfd, void *buf, size_t len, int flags, void *from,
-    int *from_lenp)
+    socklen_t *from_lenp)
 {
-	ssize_t r;
+
+	struct sockaddr *orig_name = NULL;
+	struct sockaddr sname;
+	socklen_t nlen, orig_len = 0;
+
+	ssize_t r, err;
 
 	int nosigpipe = flags & LX_MSG_NOSIGNAL;
 	struct sigaction newact, oact;
@@ -1357,14 +1676,33 @@ lx_recvfrom(int sockfd, void *buf, size_t len, int flags, void *from,
 
 	/* LTP expects EINVAL when from_len == -1 */
 	if (from_lenp != NULL) {
-		int flen;
-
-		if (uucopy(from_lenp, &flen, sizeof (int)) != 0)
+		if (uucopy(from_lenp, &nlen, sizeof (nlen)) != 0)
 			return (-errno);
-		if (flen == -1)
+		if (nlen == -1)
 			return (-EINVAL);
 	}
 
+	/*
+	 * Allocate a temporary buffer for msg_name.  This is to account for
+	 * sockaddrs that differ in size between LX and illumos.
+	 */
+	if (from != NULL) {
+		orig_len = nlen;
+		orig_name = from;
+		nlen = sizeof (struct sockaddr);
+		if (getsockname(sockfd, &sname, &nlen) < 0)
+			nlen = sizeof (struct sockaddr);
+		if ((from = SAFE_ALLOCA(nlen)) == NULL)
+			return (-ENOMEM);
+		bzero(from, nlen);
+	}
+
+	/*
+	 * LTP sometimes passes -1 for the flags but expects a different
+	 * failure result for something else that is wrong.
+	 */
+	if (flags != -1 && flags & LX_MSG_ERRQUEUE)
+		return (-EAGAIN);
 	flags = convert_sockflags(flags, "recvfrom");
 
 	/*
@@ -1388,11 +1726,19 @@ lx_recvfrom(int sockfd, void *buf, size_t len, int flags, void *from,
 	}
 
 	r = recvfrom(sockfd, buf, len, flags, (struct sockaddr *)from,
-	    from_lenp);
+	    &nlen);
 
 	if ((nosigpipe) && (sigaction(SIGPIPE, &oact, NULL) < 0))
 		lx_err_fatal("recvfrom(): could not reset SIGPIPE handler to "
 		    "emulate LX_MSG_NOSIGNAL");
+
+	/* Copy out the locally buffered name/len, if needed */
+	if (orig_name != NULL) {
+		err = stol_sockaddr(orig_name, from_lenp,
+		    (struct sockaddr *)from, nlen, orig_len);
+		if (err != 0)
+			return (-err);
+	}
 
 	return ((r < 0) ? -errno : r);
 }
@@ -1416,7 +1762,10 @@ get_proto_opt_tbl(int level)
 	case LX_SOL_SOCKET:	return (&socket_sockopts_tbl);
 	case LX_IPPROTO_IGMP:	return (&igmp_sockopts_tbl);
 	case LX_IPPROTO_TCP:	return (&tcp_sockopts_tbl);
+	case LX_IPPROTO_IPV6:	return (&ipv6_sockopts_tbl);
+	case LX_IPPROTO_ICMPV6:	return (&icmpv6_sockopts_tbl);
 	case LX_IPPROTO_RAW:	return (&raw_sockopts_tbl);
+	case LX_SOL_PACKET:	return (&packet_sockopts_tbl);
 	default:
 		lx_unsupported("Unsupported sockopt level %d", level);
 		return (NULL);
@@ -1442,7 +1791,7 @@ lx_setsockopt(int sockfd, int level, int optname, void *optval, int optlen)
 	if (optval == NULL)
 		return (-EFAULT);
 
-	if (level > LX_IPPROTO_RAW || level == LX_IPPROTO_UDP)
+	if (level > LX_SOL_PACKET || level == LX_IPPROTO_UDP)
 		return (-ENOPROTOOPT);
 
 	if ((proto_opts = get_proto_opt_tbl(level)) == NULL)
@@ -1470,11 +1819,10 @@ lx_setsockopt(int sockfd, int level, int optname, void *optval, int optlen)
 		    strcmp(lx_cmd_name, "traceroute") == 0)
 			return (0);
 
-		if (optname == LX_IP_MTU_DISCOVER &&
-		    strcmp(lx_cmd_name, "traceroute") == 0) {
+		if (optname == LX_IP_MTU_DISCOVER) {
 			/*
-			 * The native traceroute uses IP_DONTFRAG. Set this
-			 * and ignore LX_IP_MTU_DISCOVER for traceroute.
+			 * Native programs such as traceroute use IP_DONTFRAG
+			 * instead.  Set that and ignore this flag.
 			 */
 			optname = IP_DONTFRAG;
 			converted = B_TRUE;
@@ -1502,10 +1850,52 @@ lx_setsockopt(int sockfd, int level, int optname, void *optval, int optlen)
 			optval = &internal_uchar;
 			optlen = sizeof (uchar_t);
 		}
+	} else if (level == LX_IPPROTO_IPV6) {
+		/*
+		 * There isn't a good translation for IPV6_MTU and certain apps
+		 * such as bind9 will bail if it cannot be set.  We just lie
+		 * about the success for now.
+		 */
+		if (optname == LX_IPV6_MTU)
+			return (0);
+	} else if (level == LX_IPPROTO_ICMPV6) {
+		if (optname == LX_ICMP6_FILTER && optval != NULL) {
+			int i;
+			icmp6_filter_t *filter;
+			/*
+			 * Surprise! Linux's ICMP6_FILTER is inverted, when
+			 * compared to illumos
+			 */
+			if (optlen != sizeof (icmp6_filter_t))
+				return (-EINVAL);
+			if ((filter = SAFE_ALLOCA(optlen)) == NULL)
+				return (-ENOMEM);
+			if (uucopy(optval, filter, optlen) != 0)
+				return (-EFAULT);
+			for (i = 0; i < 8; i++)
+				filter->__icmp6_filt[i] ^= 0xffffffff;
+			optval = filter;
+		}
 	} else if (level == LX_SOL_SOCKET) {
 		/* Linux ignores this option. */
 		if (optname == LX_SO_BSDCOMPAT)
 			return (0);
+
+		/* Convert bpf program struct */
+		if (optname == LX_SO_ATTACH_FILTER) {
+			struct lx_bpf_program *lbp;
+			struct bpf_program *bp;
+			if (optlen != sizeof (*lbp))
+				return (-EINVAL);
+			if ((bp = SAFE_ALLOCA(sizeof (*bp))) == NULL ||
+			    (lbp = SAFE_ALLOCA(sizeof (*lbp))) == NULL)
+				return (-ENOMEM);
+			if (uucopy(optval, lbp, sizeof (*lbp)) != 0)
+				return (-errno);
+			bp->bf_len = lbp->bf_len;
+			bp->bf_insns = (struct bpf_insn *)lbp->bf_insns;
+			optval = bp;
+		}
 
 		level = SOL_SOCKET;
 	} else if (level == LX_IPPROTO_RAW) {
@@ -1516,6 +1906,29 @@ lx_setsockopt(int sockfd, int level, int optname, void *optval, int optlen)
 		if (optname == LX_ICMP_FILTER &&
 		    strcmp(lx_cmd_name, "ping") == 0)
 			return (0);
+		/*
+		 * Ping6 tries to set the IPV6_CHECKSUM offset in a way that
+		 * illumos won't allow.  Quietly ignore this to prevent it from
+		 * complaining.
+		 */
+		if (optname == LX_IPV6_CHECKSUM &&
+		    strcmp(lx_cmd_name, "ping6") == 0)
+			return (0);
+	} else if (level == LX_SOL_PACKET) {
+		level = SOL_PACKET;
+		if (optname == LX_PACKET_ADD_MEMBERSHIP ||
+		    optname == LX_PACKET_DROP_MEMBERSHIP) {
+			/* Convert Linux mr_type to illumos */
+			struct packet_mreq *mr;
+			if (optlen != sizeof (*mr))
+				return (-EINVAL);
+			mr = SAFE_ALLOCA(sizeof (*mr));
+			if (uucopy(optval, mr, sizeof (*mr)) != 0)
+				return (-errno);
+			if (--mr->mr_type > PACKET_MR_ALLMULTI)
+				return (-EINVAL);
+			optval = mr;
+		}
 	}
 
 	if (!converted) {
@@ -1550,13 +1963,13 @@ lx_getsockopt(int sockfd, int level, int optname, void *optval, int *optlenp)
 
 	/*
 	 * According to the Linux man page, a NULL optval should indicate
-	 * (as in Solaris) that no return value is expected.  Instead, it
+	 * (as in illumos) that no return value is expected.  Instead, it
 	 * actually triggers an EFAULT error.
 	 */
 	if (optval == NULL)
 		return (-EFAULT);
 
-	if (level > LX_IPPROTO_RAW || level == LX_IPPROTO_UDP)
+	if (level > LX_SOL_PACKET || level == LX_IPPROTO_UDP)
 		return (-EOPNOTSUPP);
 
 	if ((proto_opts = get_proto_opt_tbl(level)) == NULL)
@@ -1624,6 +2037,37 @@ lx_getsockopt(int sockfd, int level, int optname, void *optval, int *optlenp)
 			return (-errno);
 		return (0);
 	}
+	if ((level == LX_IPPROTO_ICMPV6) && (optname == LX_ICMP6_FILTER)) {
+		icmp6_filter_t *filter;
+		int i;
+
+		/* Verify there's going to be enough room for the results. */
+		if (uucopy(optlenp, &r, sizeof (int)) != 0)
+			return (-errno);
+		if (r < sizeof (icmp6_filter_t))
+			return (-EINVAL);
+		if ((filter = SAFE_ALLOCA(sizeof (icmp6_filter_t))) == NULL)
+			return (-ENOMEM);
+
+		r = getsockopt(sockfd, IPPROTO_ICMPV6, ICMP6_FILTER, filter,
+		    optlenp);
+		if (r != 0)
+			return (-errno);
+
+		/*
+		 * ICMP6_FILTER is inverted on Linux. Make it so before copying
+		 * back to caller's buffer.
+		 */
+		for (i = 0; i < 8; i++)
+			filter->__icmp6_filt[i] ^= 0xffffffff;
+		if ((uucopy(filter, optval, sizeof (icmp6_filter_t))) != 0)
+			return (-errno);
+		return (0);
+	}
+	if (level == LX_SOL_PACKET)
+		level = SOL_PACKET;
+	else if (level == LX_SOL_SOCKET)
+		level = SOL_SOCKET;
 
 	orig_optname = optname;
 
@@ -1633,9 +2077,6 @@ lx_getsockopt(int sockfd, int level, int optname, void *optval, int *optlenp)
 		    orig_optname, level);
 		return (-ENOPROTOOPT);
 	}
-
-	if (level == LX_SOL_SOCKET)
-		level = SOL_SOCKET;
 
 	r = getsockopt(sockfd, level, optname, optval, optlenp);
 
@@ -1667,9 +2108,12 @@ long
 lx_sendmsg(int sockfd, void *lmp, int flags)
 {
 	struct lx_msghdr msg;
+	struct sockaddr *name;
 	struct cmsghdr *cmsg;
 	void *new_cmsg = NULL;
-	int r;
+	int r, size;
+	lx_addr_type_t type;
+	socklen_t len;
 
 	int nosigpipe = flags & LX_MSG_NOSIGNAL;
 	struct sigaction newact, oact;
@@ -1681,12 +2125,29 @@ lx_sendmsg(int sockfd, void *lmp, int flags)
 	if ((uucopy(lmp, &msg, sizeof (msg))) != 0)
 		return (-errno);
 
-	if (msg.msg_name != NULL && msg.msg_namelen < sizeof (struct sockaddr))
-		return (-EINVAL);
+	/*
+	 * Perform conversion on msg_name, if present.
+	 */
+	if (msg.msg_name != NULL) {
+		if (msg.msg_namelen < sizeof (struct sockaddr))
+			return (-EINVAL);
+		size = calc_addr_size(msg.msg_name, msg.msg_namelen, &type);
+		if (size < 0)
+			return (size);
+		if ((name = SAFE_ALLOCA(size)) == NULL)
+			return (-ENOMEM);
+		bzero(name, size);
+
+		if ((r = ltos_sockaddr(name, &len, msg.msg_name,
+		    msg.msg_namelen, type)) < 0)
+			return (r);
+		msg.msg_name = name;
+		msg.msg_namelen = len;
+	}
 
 	/*
 	 * If there are control messages bundled in this message, we need
-	 * to convert them from Linux to Solaris.
+	 * to convert them from Linux to illumos.
 	 */
 	if (msg.msg_control != NULL) {
 		if (msg.msg_controllen == 0) {
@@ -1761,19 +2222,44 @@ long
 lx_recvmsg(int sockfd, void *lmp, int flags)
 {
 	struct lx_msghdr msg;
+	struct sockaddr *name, *orig_name = NULL;
+	struct sockaddr sname;
 	struct cmsghdr *cmsg = NULL;
 	void *new_cmsg = NULL;
 	int r, err;
+	socklen_t len, orig_len = 0;
+	void *msg_control = NULL;
 
 	int nosigpipe = flags & LX_MSG_NOSIGNAL;
 	struct sigaction newact, oact;
 
 	lx_debug("\trecvmsg(%d, 0x%p, 0x%x)", sockfd, lmp, flags);
 
+	/*
+	 * LTP sometimes passes -1 for the flags but expects a different
+	 * failure result for something else that is wrong.
+	 */
+	if (flags != -1 && flags & LX_MSG_ERRQUEUE)
+		return (-EAGAIN);
 	flags = convert_sockflags(flags, "recvmsg");
 
 	if ((uucopy(lmp, &msg, sizeof (msg))) != 0)
 		return (-errno);
+
+	/*
+	 * Allocate a temporary buffer for msg_name.  This is to account for
+	 * sockaddrs that differ in size between LX and illumos.
+	 */
+	if (msg.msg_name != NULL) {
+		len = sizeof (struct sockaddr);
+		if (getsockname(sockfd, &sname, &len) < 0)
+			len = sizeof (struct sockaddr);
+		name = alloca(len);
+		orig_name = msg.msg_name;
+		orig_len = msg.msg_namelen;
+		msg.msg_name = name;
+		msg.msg_namelen = len;
+	}
 
 	/*
 	 * If we are expecting to have to convert any control messages,
@@ -1785,14 +2271,25 @@ lx_recvmsg(int sockfd, void *lmp, int flags)
 		if (msg.msg_controllen == 0) {
 			msg.msg_control = NULL;
 		} else {
-			msg.msg_control = SAFE_ALLOCA(msg.msg_controllen);
-			if (msg.msg_control == NULL)
-				return (-EINVAL);
+			/*
+			 * Note that control message buffers can be quite
+			 * long, e.g. 128KB or more.  The native stack is
+			 * not big enough for these two allocations so we
+			 * use malloc(3C).
+			 */
+			lx_debug("\tmsg.msg_controllen = %d",
+			    msg.msg_controllen);
+			if ((msg_control = malloc(msg.msg_controllen)) ==
+			    NULL) {
+				return (-ENOMEM);
+			}
+			msg.msg_control = msg_control;
 #if defined(_LP64)
-			new_cmsg = SAFE_ALLOCA(msg.msg_controllen +
-			    LX_CMSG_EXTRA);
-			if (new_cmsg == NULL)
+			if ((new_cmsg = malloc(msg.msg_controllen +
+			    LX_CMSG_EXTRA)) == NULL) {
+				free(msg_control);
 				return (-EINVAL);
+			}
 #endif
 		}
 	}
@@ -1812,41 +2309,66 @@ lx_recvmsg(int sockfd, void *lmp, int flags)
 		newact.sa_flags = 0;
 		(void) sigemptyset(&newact.sa_mask);
 
-		if (sigaction(SIGPIPE, &newact, &oact) < 0)
+		if (sigaction(SIGPIPE, &newact, &oact) < 0) {
 			lx_err_fatal("recvmsg(): could not ignore SIGPIPE to "
 			    "emulate LX_MSG_NOSIGNAL");
+		}
 	}
 
 	r = _so_recvmsg(sockfd, (struct msghdr *)&msg, flags | MSG_XPG4_2);
 
-	if ((nosigpipe) && (sigaction(SIGPIPE, &oact, NULL) < 0))
+	if ((nosigpipe) && (sigaction(SIGPIPE, &oact, NULL) < 0)) {
 		lx_err_fatal("recvmsg(): could not reset SIGPIPE handler to "
 		    "emulate LX_MSG_NOSIGNAL");
+	}
 
 	if (r >= 0 && msg.msg_controllen >= sizeof (struct cmsghdr)) {
 		/*
-		 * If there are control messages bundled in this message,
-		 * we need to convert them from Linux to Solaris.
+		 * If there are control messages bundled in this message, we
+		 * need to convert them from native illumos to Linux format.
 		 */
 		if ((err = convert_cmsgs(SOL_TO_LX, &msg, new_cmsg,
-		    "recvmsg()")) != 0)
+		    "recvmsg()")) != 0) {
+			free(msg_control);
+			free(new_cmsg);
 			return (-err);
+		}
 
 		if ((uucopy(msg.msg_control, cmsg,
-		    msg.msg_controllen)) != 0)
+		    msg.msg_controllen)) != 0) {
+			free(msg_control);
+			free(new_cmsg);
 			return (-errno);
+		}
 	}
 
 	msg.msg_control = cmsg;
+
+	/* Restore the name and namelen fields in the msghdr */
+	if (msg.msg_name != NULL) {
+		err = stol_sockaddr(orig_name, &msg.msg_namelen, msg.msg_name,
+		    msg.msg_namelen, orig_len);
+		if (err != 0) {
+			free(msg_control);
+			free(new_cmsg);
+			return (-err);
+		}
+		msg.msg_name = orig_name;
+	}
 
 	/*
 	 * A handful of the values in the msghdr are set by the recvmsg()
 	 * call, so copy their values back to the caller.  Rather than iterate,
 	 * just copy the whole structure back.
 	 */
-	if (uucopy(&msg, lmp, sizeof (msg)) != 0)
+	if (uucopy(&msg, lmp, sizeof (msg)) != 0) {
+		free(msg_control);
+		free(new_cmsg);
 		return (-errno);
+	}
 
+	free(msg_control);
+	free(new_cmsg);
 	return ((r < 0) ? -errno : r);
 }
 
@@ -1855,19 +2377,37 @@ lx_recvmsg(int sockfd, void *lmp, int flags)
  * See internal comments in that function for more explanation.
  */
 long
-lx_accept4(int sockfd, void *name, int *nlp, int lx_flags)
+lx_accept4(int sockfd, void *np, int *nlp, int lx_flags)
 {
-	socklen_t namelen = 0;
+	socklen_t namelen, namelen_orig;
+	struct sockaddr *name = NULL;
 	int flags = 0;
-	int r;
+	int r, err;
 
-	lx_debug("\taccept4(%d, 0x%p, 0x%p 0x%x", sockfd, name, nlp, lx_flags);
+	lx_debug("\taccept4(%d, 0x%p, 0x%p 0x%x", sockfd, np, nlp, lx_flags);
 
-	if ((name != NULL) &&
+	if ((np != NULL) &&
 	    (uucopy((void *)nlp, &namelen, sizeof (socklen_t)) != 0))
 		return ((errno == EFAULT) ? -EINVAL : -errno);
 
+	namelen_orig = namelen;
 	lx_debug("\taccept4 namelen = %d", namelen);
+
+	if (np != NULL) {
+		/*
+		 * Use sizeof (struct sockaddr_in6) as the minimum temporary
+		 * name allocation.  This will allow families such as AF_INET6
+		 * to work properly when their namelen differs between LX and
+		 * illumos.
+		 */
+		if (namelen < sizeof (struct sockaddr_in6))
+			namelen = sizeof (struct sockaddr_in6);
+
+		name = SAFE_ALLOCA(namelen);
+		if (name == NULL)
+			return (-EINVAL);
+		bzero(name, namelen);
+	}
 
 	if (lx_flags & LX_SOCK_NONBLOCK)
 		flags |= SOCK_NONBLOCK;
@@ -1875,33 +2415,20 @@ lx_accept4(int sockfd, void *name, int *nlp, int lx_flags)
 	if (lx_flags & LX_SOCK_CLOEXEC)
 		flags |= SOCK_CLOEXEC;
 
-	if ((r = accept4(sockfd, (struct sockaddr *)name, &namelen, flags)) < 0)
+	if ((r = accept4(sockfd, name, &namelen, flags)) < 0)
 		return ((errno == EFAULT) ? -EINVAL : -errno);
 
 	lx_debug("\taccept4 namelen returned %d bytes", namelen);
 
-	if ((name != NULL) && (namelen != 0) &&
-	    (uucopy(&namelen, (void *)nlp, sizeof (socklen_t)) != 0))
-		return ((errno == EFAULT) ? -EINVAL : -errno);
-
+	if (np != NULL && namelen != 0) {
+		err = stol_sockaddr((struct sockaddr *)np, (socklen_t *)nlp,
+		    name, namelen, namelen_orig);
+		if (err != 0) {
+			close(r);
+			return ((err == EFAULT) ? -EINVAL : -err);
+		}
+	}
 	return (r);
-}
-
-/*ARGSUSED*/
-long
-lx_recvmmsg(int sockfd, void *msgvec, uint_t vlen, uint_t flags,
-    struct timespec *timeout)
-{
-	lx_unsupported("Unsupported socketcall: recvmmsg\n.");
-	return (-EINVAL);
-}
-
-/*ARGSUSED*/
-long
-lx_sendmmsg(int sockfd, void *msgvec, uint_t vlen, uint_t flags)
-{
-	lx_unsupported("Unsupported socketcall: sendmmsg\n.");
-	return (-EINVAL);
 }
 
 #ifdef __i386
@@ -2019,6 +2546,12 @@ lx_recv(ulong_t *args)
 
 	lx_debug("\trecv(%d, 0x%p, 0x%d, 0x%x)", sockfd, buf, len, flags);
 
+	/*
+	 * LTP sometimes passes -1 for the flags but expects a different
+	 * failure result for something else that is wrong.
+	 */
+	if (flags != -1 && flags & LX_MSG_ERRQUEUE)
+		return (-EAGAIN);
 	flags = convert_sockflags(flags, "recv");
 
 	/*
@@ -2061,7 +2594,7 @@ static ssize_t
 lx_recvfrom32(ulong_t *args)
 {
 	return (lx_recvfrom((int)args[0], (void *)args[1], (size_t)args[2],
-	    (int)args[3], (struct sockaddr *)args[4], (int *)args[5]));
+	    (int)args[3], (struct sockaddr *)args[4], (socklen_t *)args[5]));
 }
 
 static int

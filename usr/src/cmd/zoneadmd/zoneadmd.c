@@ -69,6 +69,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/time.h>
 
 #include <bsm/adt.h>
 #include <bsm/adt_event.h>
@@ -110,6 +111,7 @@
 static char *progname;
 char *zone_name;	/* zone which we are managing */
 zone_dochandle_t snap_hndl;	/* handle for snapshot created when ready */
+char zonepath[MAXNAMELEN];
 char pool_name[MAXNAMELEN];
 char default_brand[MAXNAMELEN];
 char brand_name[MAXNAMELEN];
@@ -619,14 +621,7 @@ mount_early_fs(void *data, const char *spec, const char *dir,
 
 	/* determine the zone rootpath */
 	if (mount_cmd) {
-		char zonepath[MAXPATHLEN];
 		char luroot[MAXPATHLEN];
-
-		if (zone_get_zonepath(zone_name,
-		    zonepath, sizeof (zonepath)) != Z_OK) {
-			zerror(zlogp, B_FALSE, "unable to determine zone path");
-			return (-1);
-		}
 
 		(void) snprintf(luroot, sizeof (luroot), "%s/lu", zonepath);
 		resolve_lofs(zlogp, luroot, sizeof (luroot));
@@ -1013,7 +1008,7 @@ zone_bootup(zlog_t *zlogp, const char *bootargs, int zstate, boolean_t debug)
 {
 	zoneid_t zoneid;
 	struct stat st;
-	char zpath[MAXPATHLEN], initpath[MAXPATHLEN], init_file[MAXPATHLEN];
+	char rpath[MAXPATHLEN], initpath[MAXPATHLEN], init_file[MAXPATHLEN];
 	char nbootargs[BOOTARGS_MAX];
 	char cmdbuf[MAXPATHLEN];
 	fs_callback_t cb;
@@ -1057,13 +1052,8 @@ zone_bootup(zlog_t *zlogp, const char *bootargs, int zstate, boolean_t debug)
 	/*
 	 * Get the brand's boot callback if it exists.
 	 */
-	if (zone_get_zonepath(zone_name, zpath, sizeof (zpath)) != Z_OK) {
-		zerror(zlogp, B_FALSE, "unable to determine zone path");
-		brand_close(bh);
-		goto bad;
-	}
 	(void) strcpy(cmdbuf, EXEC_PREFIX);
-	if (brand_get_boot(bh, zone_name, zpath, cmdbuf + EXEC_LEN,
+	if (brand_get_boot(bh, zone_name, zonepath, cmdbuf + EXEC_LEN,
 	    sizeof (cmdbuf) - EXEC_LEN) != 0) {
 		zerror(zlogp, B_FALSE,
 		    "unable to determine branded zone's boot callback");
@@ -1091,12 +1081,12 @@ zone_bootup(zlog_t *zlogp, const char *bootargs, int zstate, boolean_t debug)
 	assert(init_file[0] != '\0');
 
 	/* Try to anticipate possible problems: Make sure init is executable. */
-	if (zone_get_rootpath(zone_name, zpath, sizeof (zpath)) != Z_OK) {
+	if (zone_get_rootpath(zone_name, rpath, sizeof (rpath)) != Z_OK) {
 		zerror(zlogp, B_FALSE, "unable to determine zone root");
 		goto bad;
 	}
 
-	(void) snprintf(initpath, sizeof (initpath), "%s%s", zpath, init_file);
+	(void) snprintf(initpath, sizeof (initpath), "%s%s", rpath, init_file);
 
 	if (stat(initpath, &st) == -1) {
 		zerror(zlogp, B_TRUE, "could not stat %s", initpath);
@@ -1164,6 +1154,9 @@ zone_bootup(zlog_t *zlogp, const char *bootargs, int zstate, boolean_t debug)
 	if (brand_poststatechg(zlogp, zstate, Z_BOOT, debug) != 0)
 		goto bad;
 
+	/* Startup a thread to perform zfd logging/tty svc for the zone. */
+	create_log_thread(zlogp, zone_id);
+
 	/* Startup a thread to perform memory capping for the zone. */
 	create_mcap_thread(zlogp, zone_id);
 
@@ -1194,8 +1187,12 @@ zone_halt(zlog_t *zlogp, boolean_t unmount_cmd, boolean_t rebooting, int zstate,
 	if (vplat_teardown(zlogp, unmount_cmd, rebooting, debug) != 0) {
 		if (!bringup_failure_recovery)
 			zerror(zlogp, B_FALSE, "unable to destroy zone");
+		destroy_log_thread();
 		return (-1);
 	}
+
+	/* Shut down is done, stop the log thread */
+	destroy_log_thread();
 
 	if (brand_poststatechg(zlogp, zstate, Z_HALT, debug) != 0)
 		return (-1);
@@ -1217,7 +1214,6 @@ zone_graceful_shutdown(zlog_t *zlogp)
 	pid_t child;
 	char cmdbuf[MAXPATHLEN];
 	brand_handle_t bh = NULL;
-	char zpath[MAXPATHLEN];
 	ctid_t ct;
 	int tmpl_fd;
 	int child_status;
@@ -1238,18 +1234,12 @@ zone_graceful_shutdown(zlog_t *zlogp)
 		return (-1);
 	}
 
-	if (zone_get_zonepath(zone_name, zpath, sizeof (zpath)) != Z_OK) {
-		zerror(zlogp, B_FALSE, "unable to determine zone path");
-		brand_close(bh);
-		return (-1);
-	}
-
 	/*
 	 * If there is a brand 'shutdown' callback, execute it now to give the
 	 * brand a chance to cleanup any custom configuration.
 	 */
 	(void) strcpy(cmdbuf, EXEC_PREFIX);
-	if (brand_get_shutdown(bh, zone_name, zpath, cmdbuf + EXEC_LEN,
+	if (brand_get_shutdown(bh, zone_name, zonepath, cmdbuf + EXEC_LEN,
 	    sizeof (cmdbuf) - EXEC_LEN) != 0 || strlen(cmdbuf) <= EXEC_LEN) {
 		(void) strcat(cmdbuf, SHUTDOWN_DEFAULT);
 	}
@@ -1387,6 +1377,36 @@ audit_put_record(zlog_t *zlogp, ucred_t *uc, int return_val,
 }
 
 /*
+ * Log the exit time and status of the zone's init process into
+ * {zonepath}/lastexited. If the zone shutdown normally, the exit status will
+ * be -1, otherwise it will be the exit status as described in wait.3c.
+ * If the zone is configured to restart init, then nothing will be logged if
+ * init exits unexpectedly (the kernel will never upcall in this case).
+ */
+static void
+log_init_exit(int status)
+{
+	char p[MAXPATHLEN];
+	char buf[128];
+	struct timeval t;
+	int fd;
+
+	if (snprintf(p, sizeof (p), "%s/lastexited", zonepath) > sizeof (p))
+		return;
+	if (gettimeofday(&t, NULL) != 0)
+		return;
+	if (snprintf(buf, sizeof (buf), "%ld.%ld %d\n", t.tv_sec, t.tv_usec,
+	    status) > sizeof (buf))
+		return;
+	if ((fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644)) < 0)
+		return;
+
+	(void) write(fd, buf, strlen(buf));
+
+	(void) close(fd);
+}
+
+/*
  * The main routine for the door server that deals with zone state transitions.
  */
 /* ARGSUSED */
@@ -1400,6 +1420,7 @@ server(void *cookie, char *args, size_t alen, door_desc_t *dp,
 	zone_state_t zstate;
 	zone_cmd_t cmd;
 	boolean_t debug;
+	int init_status;
 	zone_cmd_arg_t *zargp;
 
 	boolean_t kernelcall = B_TRUE;
@@ -1453,6 +1474,7 @@ server(void *cookie, char *args, size_t alen, door_desc_t *dp,
 	}
 	cmd = zargp->cmd;
 	debug = zargp->debug;
+	init_status = zargp->status;
 
 	if (door_ucred(&uc) != 0) {
 		zerror(&logsys, B_TRUE, "door_ucred");
@@ -1781,6 +1803,11 @@ server(void *cookie, char *args, size_t alen, door_desc_t *dp,
 			rval = 0;
 			break;
 		case Z_HALT:
+			if (kernelcall) {
+				log_init_exit(init_status);
+			} else {
+				log_init_exit(-1);
+			}
 			if ((rval = zone_halt(zlogp, B_FALSE, B_FALSE, zstate,
 			    debug)) != 0)
 				break;
@@ -1994,12 +2021,15 @@ top:
 			    zone_name, zone_state_str(zstate));
 
 			/*
-			 * Startup a thread to perform memory capping for the
+			 * Startup a thread to perform the zfd logging/tty svc
+			 * and a thread to perform memory capping for the
 			 * zone. zlogp won't be valid for much longer so use
 			 * logsys.
 			 */
-			if ((zid = getzoneidbyname(zone_name)) != -1)
+			if ((zid = getzoneidbyname(zone_name)) != -1) {
+				create_log_thread(&logsys, zid);
 				create_mcap_thread(&logsys, zid);
+			}
 
 			/* recover the global configuration snapshot */
 			if (snap_hndl == NULL) {
@@ -2079,15 +2109,10 @@ set_brand_env(zlog_t *zlogp)
 static int
 brand_callback_init(brand_handle_t bh, char *zone_name)
 {
-	char zpath[MAXPATHLEN];
-
-	if (zone_get_zonepath(zone_name, zpath, sizeof (zpath)) != Z_OK)
-		return (-1);
-
 	(void) strlcpy(pre_statechg_hook, EXEC_PREFIX,
 	    sizeof (pre_statechg_hook));
 
-	if (brand_get_prestatechange(bh, zone_name, zpath,
+	if (brand_get_prestatechange(bh, zone_name, zonepath,
 	    pre_statechg_hook + EXEC_LEN,
 	    sizeof (pre_statechg_hook) - EXEC_LEN) != 0)
 		return (-1);
@@ -2098,7 +2123,7 @@ brand_callback_init(brand_handle_t bh, char *zone_name)
 	(void) strlcpy(post_statechg_hook, EXEC_PREFIX,
 	    sizeof (post_statechg_hook));
 
-	if (brand_get_poststatechange(bh, zone_name, zpath,
+	if (brand_get_poststatechange(bh, zone_name, zonepath,
 	    post_statechg_hook + EXEC_LEN,
 	    sizeof (post_statechg_hook) - EXEC_LEN) != 0)
 		return (-1);
@@ -2109,7 +2134,7 @@ brand_callback_init(brand_handle_t bh, char *zone_name)
 	(void) strlcpy(query_hook, EXEC_PREFIX,
 	    sizeof (query_hook));
 
-	if (brand_get_query(bh, zone_name, zpath, query_hook + EXEC_LEN,
+	if (brand_get_query(bh, zone_name, zonepath, query_hook + EXEC_LEN,
 	    sizeof (query_hook) - EXEC_LEN) != 0)
 		return (-1);
 
@@ -2235,6 +2260,11 @@ main(int argc, char *argv[])
 		    "cannot manage a zone which is in state '%s'",
 		    zone_state_str(zstate));
 		return (1);
+	}
+
+	if (zone_get_zonepath(zone_name, zonepath, sizeof (zonepath)) != Z_OK) {
+		zerror(zlogp, B_FALSE, "unable to determine zone path");
+		return (-1);
 	}
 
 	if (zonecfg_default_brand(default_brand,

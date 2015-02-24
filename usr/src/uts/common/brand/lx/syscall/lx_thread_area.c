@@ -21,7 +21,7 @@
 /*
  * Copyright 2006 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
- * Copyright 2014 Joyent, Inc.  All rights reserved.
+ * Copyright 2015 Joyent, Inc.
  */
 
 #include <sys/types.h>
@@ -33,35 +33,47 @@
 #include <sys/brand.h>
 #include <sys/lx_brand.h>
 #include <sys/lx_ldt.h>
+#include <sys/lx_misc.h>
 #include <sys/x86_archext.h>
 #include <sys/controlregs.h>
-
-/* For arch_prctl(2) */
-#define	LX_ARCH_SET_GS	0x1001
-#define	LX_ARCH_SET_FS	0x1002
-#define	LX_ARCH_GET_FS	0x1003
-#define	LX_ARCH_GET_GS	0x1004
+#include <lx_syscall.h>
 
 long
 lx_arch_prctl(int code, ulong_t addr)
 {
-	struct lx_lwp_data *llwp = ttolxlwp(curthread);
+#if defined(__amd64)
+	klwp_t *lwp = ttolwp(curthread);
+	lx_lwp_data_t *llwp = lwptolxlwp(lwp);
+	pcb_t *pcb = &lwp->lwp_pcb;
 
 	/* We currently only support [g|s]et_fs */
 	switch (code) {
 	case LX_ARCH_GET_FS:
 		if (copyout(&llwp->br_lx_fsbase, (void *)addr,
-		    sizeof (llwp->br_lx_fsbase)))
+		    sizeof (llwp->br_lx_fsbase)) != 0) {
 			return (set_errno(EFAULT));
+		}
 		break;
+
 	case LX_ARCH_SET_FS:
 		llwp->br_lx_fsbase = addr;
-		/* save current native libc fsbase */
-		llwp->br_ntv_fsbase = rdmsr(MSR_AMD_FSBASE);
+
+		kpreempt_disable();
+		if (pcb->pcb_fsbase != llwp->br_lx_fsbase) {
+			pcb->pcb_fsbase = llwp->br_lx_fsbase;
+
+			/*
+			 * Ensure we go out via update_sregs.
+			 */
+			pcb->pcb_rupdate = 1;
+		}
+		kpreempt_enable();
 		break;
+
 	default:
 		return (set_errno(EINVAL));
 	}
+#endif
 
 	return (0);
 }

@@ -20,7 +20,7 @@
  */
 
 /*
- * Copyright 2014, Joyent, Inc. All rights reserved.
+ * Copyright 2015, Joyent, Inc. All rights reserved.
  */
 
 #include <sys/errno.h>
@@ -50,7 +50,7 @@ void	sngl_setbrand(proc_t *);
 int	sngl_getattr(zone_t *, int, void *, size_t *);
 int	sngl_setattr(zone_t *, int, void *, size_t);
 int	sngl_brandsys(int, int64_t *, uintptr_t, uintptr_t, uintptr_t,
-	uintptr_t, uintptr_t, uintptr_t);
+	uintptr_t, uintptr_t);
 void	sngl_copy_procdata(proc_t *, proc_t *);
 void	sngl_proc_exit(struct proc *, klwp_t *);
 void	sngl_exec();
@@ -63,28 +63,41 @@ int	sngl_elfexec(vnode_t *, execa_t *, uarg_t *, intpdata_t *, int,
 
 /* SNGL brand */
 struct brand_ops sngl_brops = {
-	sngl_init_brand_data,
-	sngl_free_brand_data,
-	sngl_brandsys,
-	sngl_setbrand,
-	sngl_getattr,
-	sngl_setattr,
-	sngl_copy_procdata,
-	sngl_proc_exit,
-	sngl_exec,
-	lwp_setrval,
-	sngl_initlwp,
-	sngl_forklwp,
-	sngl_freelwp,
-	sngl_lwpexit,
-	sngl_elfexec,
-	NULL,
-	NULL,
-	NULL,
-	NSIG,
-	NULL,
-	NULL,
-	NULL
+	sngl_init_brand_data,		/* b_init_brand_data */
+	sngl_free_brand_data,		/* b_free_brand_data */
+	sngl_brandsys,			/* b_brandsys */
+	sngl_setbrand,			/* b_setbrand */
+	sngl_getattr,			/* b_getattr */
+	sngl_setattr,			/* b_setattr */
+	sngl_copy_procdata,		/* b_copy_procdata */
+	sngl_proc_exit,			/* b_proc_exit */
+	sngl_exec,			/* b_exec */
+	lwp_setrval,			/* b_lwp_setrval */
+	sngl_initlwp,			/* b_initlwp */
+	sngl_forklwp,			/* b_forklwp */
+	sngl_freelwp,			/* b_freelwp */
+	sngl_lwpexit,			/* b_lwpexit */
+	sngl_elfexec,			/* b_elfexec */
+	NULL,				/* b_sigset_native_to_brand */
+	NULL,				/* b_sigset_brand_to_native */
+	NULL,				/* b_psig_to_proc */
+	NSIG,				/* b_nsig */
+	NULL,				/* b_exit_with_sig */
+	NULL,				/* b_wait_filter */
+	NULL,				/* b_native_exec */
+	NULL,				/* b_ptrace_exectrap */
+	NULL,				/* b_map32limit */
+	NULL,				/* b_stop_notify */
+	NULL,				/* b_waitid_helper */
+	NULL,				/* b_sigcld_repost */
+	NULL,				/* b_issig_stop */
+	NULL,				/* b_savecontext */
+#if defined(_SYSCALL32_IMPL)
+	NULL,				/* b_savecontext32 */
+#endif
+	NULL,				/* b_restorecontext */
+	NULL,				/* b_sendsig_stack */
+	NULL				/* b_sendsig */
 };
 
 #ifdef	__amd64
@@ -93,7 +106,8 @@ struct brand_mach_ops sngl_mops = {
 	sngl_brand_sysenter_callback,
 	sngl_brand_int91_callback,
 	sngl_brand_syscall_callback,
-	sngl_brand_syscall32_callback
+	sngl_brand_syscall32_callback,
+	NULL
 };
 
 #else	/* ! __amd64 */
@@ -102,6 +116,7 @@ struct brand_mach_ops sngl_mops = {
 	sngl_brand_sysenter_callback,
 	NULL,
 	sngl_brand_syscall_callback,
+	NULL,
 	NULL
 };
 #endif	/* __amd64 */
@@ -147,7 +162,7 @@ sngl_setattr(zone_t *zone, int attr, void *buf, size_t bufsize)
 /*ARGSUSED*/
 int
 sngl_brandsys(int cmd, int64_t *rval, uintptr_t arg1, uintptr_t arg2,
-    uintptr_t arg3, uintptr_t arg4, uintptr_t arg5, uintptr_t arg6)
+    uintptr_t arg3, uintptr_t arg4, uintptr_t arg5)
 {
 	int	res;
 
@@ -219,7 +234,7 @@ sngl_elfexec(vnode_t *vp, execa_t *uap, uarg_t *args, intpdata_t *idatap,
 {
 	return (brand_solaris_elfexec(vp, uap, args, idatap, level, execsz,
 	    setid, exec_file, cred, brand_action, &sngl_brand, SNGL_BRANDNAME,
-	    SNGL_LIB, SNGL_LIB32, SNGL_LINKER, SNGL_LINKER32));
+	    SNGL_LIB, SNGL_LIB32));
 }
 
 int

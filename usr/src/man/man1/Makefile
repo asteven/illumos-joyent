@@ -87,6 +87,8 @@ MANFILES=	acctcom.1			\
 	 	csh.1				\
 	 	csplit.1			\
 	 	ctags.1				\
+		ctfdiff.1			\
+		ctfdump.1			\
 	 	ctrun.1				\
 	 	ctstat.1			\
 	 	ctwatch.1			\
@@ -183,6 +185,7 @@ MANFILES=	acctcom.1			\
 	 	krb5-config.1			\
 	 	ksh93.1				\
 	 	ktutil.1			\
+		kvmstat.1			\
 	 	lari.1				\
 	 	last.1				\
 	 	lastcomm.1			\

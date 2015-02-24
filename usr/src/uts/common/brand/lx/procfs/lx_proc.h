@@ -21,7 +21,7 @@
 /*
  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
- * Copyright 2014 Joyent, Inc.  All rights reserved.
+ * Copyright 2015 Joyent, Inc.
  */
 
 #ifndef	_LXPROC_H
@@ -134,9 +134,11 @@ typedef enum lxpr_nodetype {
 	LXPR_NET_ARP,		/* /proc/net/arp	*/
 	LXPR_NET_DEV,		/* /proc/net/dev	*/
 	LXPR_NET_DEV_MCAST,	/* /proc/net/dev_mcast	*/
+	LXPR_NET_IF_INET6,	/* /proc/net/if_inet6	*/
 	LXPR_NET_IGMP,		/* /proc/net/igmp	*/
 	LXPR_NET_IP_MR_CACHE,	/* /proc/net/ip_mr_cache */
 	LXPR_NET_IP_MR_VIF,	/* /proc/net/ip_mr_vif	*/
+	LXPR_NET_IPV6_ROUTE,	/* /proc/net/ipv6_route	*/
 	LXPR_NET_MCFILTER,	/* /proc/net/mcfilter	*/
 	LXPR_NET_NETSTAT,	/* /proc/net/netstat	*/
 	LXPR_NET_RAW,		/* /proc/net/raw	*/
@@ -147,11 +149,14 @@ typedef enum lxpr_nodetype {
 	LXPR_NET_SNMP,		/* /proc/net/snmp	*/
 	LXPR_NET_STAT,		/* /proc/net/stat	*/
 	LXPR_NET_TCP,		/* /proc/net/tcp	*/
+	LXPR_NET_TCP6,		/* /proc/net/tcp6	*/
 	LXPR_NET_UDP,		/* /proc/net/udp	*/
+	LXPR_NET_UDP6,		/* /proc/net/udp6	*/
 	LXPR_NET_UNIX,		/* /proc/net/unix	*/
 	LXPR_PARTITIONS,	/* /proc/partitions	*/
 	LXPR_SELF,		/* /proc/self		*/
 	LXPR_STAT,		/* /proc/stat		*/
+	LXPR_SWAPS,		/* /proc/swaps		*/
 	LXPR_SYSDIR,		/* /proc/sys/		*/
 	LXPR_SYS_FSDIR,		/* /proc/sys/fs/	*/
 	LXPR_SYS_FS_INOTIFYDIR,	/* /proc/sys/fs/inotify	*/
@@ -244,6 +249,13 @@ void lxpr_unlock(proc_t *);
 
 #ifdef	__cplusplus
 }
+#endif
+
+#ifndef islower
+#define	islower(x)	(((unsigned)(x) >= 'a') && ((unsigned)(x) <= 'z'))
+#endif
+#ifndef toupper
+#define	toupper(x)	(islower(x) ? (x) - 'a' + 'A' : (x))
 #endif
 
 #endif /* _LXPROC_H */

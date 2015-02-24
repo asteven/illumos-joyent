@@ -24,6 +24,10 @@
  * Use is subject to license terms.
  */
 
+/*
+ * Copyright (c) 2015, Joyent, Inc.  All rights reserved.
+ */
+
 #ifndef	_SYS_THREAD_H
 #define	_SYS_THREAD_H
 
@@ -367,7 +371,7 @@ typedef struct _kthread {
 #define	T_WOULDBLOCK	0x0020	/* for lockfs */
 #define	T_DONTBLOCK	0x0040	/* for lockfs */
 #define	T_DONTPEND	0x0080	/* for lockfs */
-#define	T_SYS_PROF	0x0100	/* profiling on for duration of system call */
+#define	T_SPLITSTK	0x0100	/* kernel stack is currently split */
 #define	T_WAITCVSEM	0x0200	/* waiting for a lwp_cv or lwp_sema on sleepq */
 #define	T_WATCHPT	0x0400	/* thread undergoing a watchpoint emulation */
 #define	T_PANIC		0x0800	/* thread initiated a system panic */
@@ -415,8 +419,9 @@ typedef struct _kthread {
 #define	TS_RESUME	0x1000	/* setrun() by CPR resume process */
 #define	TS_CREATE	0x2000	/* setrun() by syslwp_create() */
 #define	TS_RUNQMATCH	0x4000	/* exact run queue balancing by setbackdq() */
+#define	TS_BSTART	0x8000	/* setrun() by brand */
 #define	TS_ALLSTART	\
-	(TS_CSTART|TS_UNPAUSE|TS_XSTART|TS_PSTART|TS_RESUME|TS_CREATE)
+	(TS_CSTART|TS_UNPAUSE|TS_XSTART|TS_PSTART|TS_RESUME|TS_CREATE|TS_BSTART)
 #define	TS_ANYWAITQ	(TS_PROJWAITQ|TS_ZONEWAITQ)
 
 /*
@@ -443,6 +448,10 @@ typedef struct _kthread {
 /* True if thread is stopped on an event of interest */
 #define	ISTOPPED(t) ((t)->t_state == TS_STOPPED && \
 			!((t)->t_schedflag & TS_PSTART))
+
+/* True if thread is stopped for a brand-specific reason */
+#define	BSTOPPED(t)	((t)->t_state == TS_STOPPED && \
+			    !((t)->t_schedflag & TS_BSTART))
 
 /* True if thread is asleep and wakeable */
 #define	ISWAKEABLE(t) (((t)->t_state == TS_SLEEP && \

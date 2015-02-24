@@ -18,9 +18,11 @@
  *
  * CDDL HEADER END
  */
+
 /*
  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
+ * Copyright 2015, Joyent, Inc.
  */
 
 #include <sys/types.h>
@@ -99,7 +101,7 @@ lx_pid_remove_hash(pid_t pid, id_t tid)
 	return (lpidp);
 }
 
-struct pid * pid_find(pid_t pid);
+struct pid *pid_find(pid_t pid);
 
 /*
  * given a solaris pid/tid pair, create a linux pid
@@ -115,7 +117,14 @@ lx_pid_assign(kthread_t *t)
 	lx_lwp_data_t *lwpd = ttolxlwp(t);
 	pid_t newpid;
 
-	if (p->p_lwpcnt > 0) {
+	/*
+	 * When lx_initlwp is called from lx_setbrand, p_lwpcnt will already be
+	 * equal to 1. Since lx_initlwp is being called against an lwp that
+	 * already exists, pid_allocate is not necessary.
+	 *
+	 * We check for this by testing br_ppid == 0.
+	 */
+	if (p->p_lwpcnt > 0 && lwpd->br_ppid != 0) {
 		/*
 		 * Allocate a pid for any thread other than the first
 		 */
@@ -212,6 +221,28 @@ int
 lx_lpid_to_spair(pid_t l_pid, pid_t *s_pid, id_t *s_tid)
 {
 	struct lx_pid *hp;
+
+	if (l_pid == 1) {
+		pid_t initpid;
+
+		/*
+		 * We are trying to look up the Linux init process for the
+		 * current zone, which we pretend has pid 1.
+		 */
+		if ((initpid = curzone->zone_proc_initpid) == -1) {
+			/*
+			 * We could not find the init process for this zone.
+			 */
+			return (-1);
+		}
+
+		if (s_pid != NULL)
+			*s_pid = initpid;
+		if (s_tid != NULL)
+			*s_tid = 1;
+
+		return (0);
+	}
 
 	mutex_enter(&hash_lock);
 	for (hp = ltos_pid_hash[LTOS_HASH(l_pid)]; hp; hp = hp->ltos_next) {

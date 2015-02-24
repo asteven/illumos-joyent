@@ -25,7 +25,7 @@
  */
 
 /*
- * Copyright 2014 Joyent, Inc. All rights reserved.
+ * Copyright 2015 Joyent, Inc. All rights reserved.
  */
 
 #ifndef _SYS_LX_SYSCALL_H
@@ -74,7 +74,6 @@ extern long lx_readlink(uintptr_t, uintptr_t, uintptr_t);
 extern long lx_readdir(uintptr_t, uintptr_t, uintptr_t);
 extern long lx_getdents(uintptr_t, uintptr_t, uintptr_t);
 extern long lx_getdents64(uintptr_t, uintptr_t, uintptr_t);
-extern long lx_getpid(void);
 extern long lx_execve(uintptr_t, uintptr_t, uintptr_t);
 extern long lx_dup2(uintptr_t, uintptr_t);
 extern long lx_dup3(uintptr_t, uintptr_t, uintptr_t);
@@ -83,11 +82,12 @@ extern long lx_vhangup(void);
 extern long lx_fadvise64(uintptr_t, off64_t, uintptr_t, uintptr_t);
 extern long lx_fadvise64_64(uintptr_t, off64_t, off64_t, uintptr_t);
 
-extern long lx_read(uintptr_t, uintptr_t, uintptr_t);
 extern long lx_readv(uintptr_t, uintptr_t, uintptr_t);
 extern long lx_writev(uintptr_t, uintptr_t, uintptr_t);
 extern long lx_pread(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 extern long lx_pwrite(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+extern long lx_preadv(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+extern long lx_pwritev(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 extern long lx_pread64(uintptr_t, uintptr_t, uintptr_t, uintptr_t,
     uintptr_t);
 extern long lx_pwrite64(uintptr_t, uintptr_t, uintptr_t, uintptr_t,
@@ -102,11 +102,9 @@ extern long lx_getpeername(int, void *, int *);
 extern long lx_getsockname(int, void *, int *);
 extern long lx_getsockopt(int, int, int, void *, int *);
 extern long lx_listen(int, int);
-extern long lx_recvfrom(int, void *, size_t, int, void *, int *);
+extern long lx_recvfrom(int, void *, size_t, int, void *, socklen_t *);
 extern long lx_recvmsg(int, void *, int);
-extern long lx_recvmmsg(int, void *, uint_t, uint_t, struct timespec *);
 extern long lx_sendmsg(int, void *, int);
-extern long lx_sendmmsg(int, void *, uint_t, uint_t);
 extern long lx_sendto(int, void *, size_t, int, void *, int);
 extern long lx_setsockopt(int, int, int, void *, int);
 extern long lx_shutdown(int, int);
@@ -117,6 +115,7 @@ extern long lx_select(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 extern long lx_pselect6(uintptr_t, uintptr_t, uintptr_t, uintptr_t,
     uintptr_t, uintptr_t);
 extern long lx_poll(uintptr_t, uintptr_t, uintptr_t);
+extern long lx_ppoll(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 extern long lx_epoll_ctl(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 extern long lx_oldgetrlimit(uintptr_t, uintptr_t);
 extern long lx_getrlimit(uintptr_t, uintptr_t);
@@ -132,12 +131,6 @@ extern long lx_getpgid(uintptr_t);
 extern long lx_setpgid(uintptr_t, uintptr_t);
 extern long lx_getsid(uintptr_t);
 extern long lx_setsid(void);
-extern long lx_setgroups(uintptr_t, uintptr_t);
-
-
-extern long lx_waitpid(uintptr_t, uintptr_t, uintptr_t);
-extern long lx_waitid(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
-extern long lx_wait4(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 
 extern long lx_getuid16(void);
 extern long lx_getgid16(void);
@@ -168,6 +161,12 @@ extern long lx_clock_getres(int, struct timespec *);
 extern long lx_clock_nanosleep(int, int flags, struct timespec *,
     struct timespec *);
 extern long lx_adjtimex(void *);
+extern long lx_timer_create(int, struct sigevent *, timer_t *);
+extern long lx_timer_settime(timer_t, int, struct itimerspec *,
+    struct itimerspec *);
+extern long lx_timer_gettime(timer_t, struct itimerspec *);
+extern long lx_timer_getoverrun(timer_t);
+extern long lx_timer_delete(timer_t);
 
 extern long lx_truncate(uintptr_t, uintptr_t);
 extern long lx_ftruncate(uintptr_t, uintptr_t);
@@ -177,7 +176,6 @@ extern long lx_ftruncate64(uintptr_t, uintptr_t, uintptr_t);
 extern long lx_sysctl(uintptr_t);
 extern long lx_fsync(uintptr_t);
 extern long lx_fdatasync(uintptr_t);
-extern long lx_pipe2(uintptr_t, uintptr_t);
 extern long lx_link(uintptr_t, uintptr_t);
 extern long lx_unlink(uintptr_t);
 extern long lx_rmdir(uintptr_t);
@@ -193,10 +191,12 @@ extern long lx_llseek(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 extern long lx_lseek(uintptr_t, uintptr_t, uintptr_t);
 extern long lx_sysfs(uintptr_t, uintptr_t, uintptr_t);
 
+extern long lx_getcpu(unsigned int *, uintptr_t, uintptr_t);
 extern long lx_getcwd(uintptr_t, uintptr_t);
 extern long lx_uname(uintptr_t);
 extern long lx_reboot(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 extern long lx_getgroups16(uintptr_t, uintptr_t);
+extern long lx_setgroups(uintptr_t, uintptr_t);
 extern long lx_setgroups16(uintptr_t, uintptr_t);
 extern long lx_personality(uintptr_t);
 
@@ -316,6 +316,8 @@ extern long lx_epoll_pwait(int, void *, int, int, const sigset_t *);
 extern long lx_epoll_create(int);
 extern long lx_epoll_create1(int);
 extern long lx_epoll_wait(int, void *, int, int);
+extern long lx_eventfd(unsigned int);
+extern long lx_eventfd2(unsigned int, int);
 extern long lx_fchdir(int);
 extern long lx_fchmod(int, mode_t);
 extern long lx_getgid(void);
@@ -341,45 +343,37 @@ extern long lx_shmdt(char *);
 extern long lx_stime(const time_t *);
 extern long lx_symlink(const char *, const char *);
 extern long lx_syslog(int, char *, int);
+extern long lx_timerfd_create(int, int);
+extern long lx_timerfd_settime(int, int,
+    const struct itimerspec *, struct itimerspec *);
+extern long lx_timerfd_gettime(int, struct itimerspec *);
 extern long lx_umask(mode_t);
 extern long lx_utimes(const char *, const struct timeval *);
-extern long lx_write(int, const void *, size_t);
-extern long lx_yield(void);
 
 #endif	/* !defined(_ASM) */
 
-/*
- * Constants for the In-Kernel Emulation table.
- */
-#define	LX_EMUL_getpid			1
-#define	LX_EMUL_kill			2
-#define	LX_EMUL_pipe			3
-#define	LX_EMUL_brk			4
-#define	LX_EMUL_getppid			5
-#define	LX_EMUL_sysinfo			6
-#define	LX_EMUL_clone			7
-#define	LX_EMUL_modify_ldt		8
-#define	LX_EMUL_sched_setparam		9
-#define	LX_EMUL_sched_getparam		10
-#define	LX_EMUL_sched_rr_get_interval	11
-#define	LX_EMUL_setresuid16		12
-#define	LX_EMUL_setresgid16		13
-#define	LX_EMUL_rt_sigqueueinfo		14
-#define	LX_EMUL_setgroups		15
-#define	LX_EMUL_setresuid		16
-#define	LX_EMUL_setresgid		17
-#define	LX_EMUL_gettid			18
-#define	LX_EMUL_tkill			19
-#define	LX_EMUL_futex			20
-#define	LX_EMUL_set_thread_area		21
-#define	LX_EMUL_get_thread_area		22
-#define	LX_EMUL_set_tid_address		23
-#define	LX_EMUL_pipe2			24
-#define	LX_EMUL_rt_tgsigqueueinfo	25
-#define	LX_EMUL_arch_prctl		26
-#define	LX_EMUL_tgkill			LX_N_IKE_FUNCS
 
-/* Note: adjust LX_N_IKE_FUNCS when adding new in-kernel functions */
+#if defined(_LP64)
+/*
+ * Linux vsyscall addresses:
+ */
+#define	LX_VSYS_gettimeofday	(uintptr_t)0xffffffffff600000
+#define	LX_VSYS_time		(uintptr_t)0xffffffffff600400
+#define	LX_VSYS_getcpu		(uintptr_t)0xffffffffff600800
+
+/*
+ * System call numbers for vsyscall revectoring:
+ */
+#define	LX_SYS_gettimeofday	96
+#define	LX_SYS_time		201
+#define	LX_SYS_getcpu		309
+#endif
+
+#if defined(_LP64)
+#define	LX_SYS_clone		56
+#else
+#define	LX_SYS_clone		120
+#endif
 
 #ifdef	__cplusplus
 }

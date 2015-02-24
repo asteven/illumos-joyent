@@ -554,13 +554,13 @@ extern off_t tell(int);
 extern int truncate(const char *, off_t);
 #endif /* !defined(__XOPEN_OR_POSIX) || defined(_XPG4_2)... */
 extern char *ttyname(int);
-#if !defined(__XOPEN_OR_POSIX) || defined(_XPG4_2) || defined(__EXTENSIONS__)
+#if (defined(_XPG4_2) && !defined(_XPG7)) || !defined(_STRICT_SYMBOLS)
 extern useconds_t ualarm(useconds_t, useconds_t);
-#endif /* !defined(__XOPEN_OR_POSIX) || defined(_XPG4_2)... */
+#endif
 extern int unlink(const char *);
-#if !defined(__XOPEN_OR_POSIX) || defined(_XPG4_2) || defined(__EXTENSIONS__)
+#if (defined(_XPG4_2) && !defined(_XPG7)) || !defined(_STRICT_SYMBOLS)
 extern int usleep(useconds_t);
-#endif /* !defined(__XOPEN_OR_POSIX) || defined(_XPG4_2)... */
+#endif
 #if !defined(__XOPEN_OR_POSIX) || defined(_XPG4_2) || defined(__EXTENSIONS__)
 extern pid_t vfork(void) __RETURNS_TWICE;
 #endif /* !defined(__XOPEN_OR_POSIX) || defined(_XPG4_2)... */
@@ -716,6 +716,10 @@ extern char *ttyname_r(int, char *, int);
 #endif /* (_POSIX_C_SOURCE - 0 >= 199506L) || ... */
 
 #endif /* defined(__EXTENSIONS__) || defined(_REENTRANT)... */
+
+#if !defined(_STRICT_SYMBOLS)
+extern int getentropy(void *, size_t);
+#endif	/* !_STRICT_SYMBOLS */
 
 #ifdef	__cplusplus
 }

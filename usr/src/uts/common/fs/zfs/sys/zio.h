@@ -151,9 +151,6 @@ typedef enum zio_priority {
 	ZIO_PRIORITY_NOW		/* non-queued i/os (e.g. free) */
 } zio_priority_t;
 
-#define	ZIO_PIPELINE_CONTINUE		0x100
-#define	ZIO_PIPELINE_STOP		0x101
-
 enum zio_flag {
 	/*
 	 * Flags inherited by gang, ddt, and vdev children,
@@ -423,6 +420,7 @@ struct zio {
 	hrtime_t	io_timestamp;	/* time I/O entered zio pipeline */
 	hrtime_t	io_dispatched;	/* time I/O was dispatched to disk */
 	avl_node_t	io_queue_node;
+	avl_node_t	io_offset_node;
 
 	/* Internal pipeline state */
 	enum zio_flag	io_flags;
@@ -516,10 +514,8 @@ extern zio_t *zio_unique_parent(zio_t *cio);
 extern void zio_add_child(zio_t *pio, zio_t *cio);
 
 extern void *zio_buf_alloc(size_t size);
-extern void *zio_buf_alloc_canfail(size_t size);
 extern void zio_buf_free(void *buf, size_t size);
 extern void *zio_data_buf_alloc(size_t size);
-extern void *zio_data_buf_alloc_canfail(size_t size);
 extern void zio_data_buf_free(void *buf, size_t size);
 
 extern void zio_resubmit_stage_async(void *);

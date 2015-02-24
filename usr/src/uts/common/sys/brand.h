@@ -21,7 +21,7 @@
 
 /*
  * Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright 2014 Joyent, Inc.  All rights reserved.
+ * Copyright 2015, Joyent, Inc.
  */
 
 #ifndef _SYS_BRAND_H
@@ -107,7 +107,7 @@ struct brand_ops {
 	void	(*b_init_brand_data)(zone_t *);
 	void	(*b_free_brand_data)(zone_t *);
 	int	(*b_brandsys)(int, int64_t *, uintptr_t, uintptr_t, uintptr_t,
-		uintptr_t, uintptr_t, uintptr_t);
+		uintptr_t, uintptr_t);
 	void	(*b_setbrand)(struct proc *);
 	int	(*b_getattr)(zone_t *, int, void *, size_t *);
 	int	(*b_setattr)(zone_t *, int, void *, size_t);
@@ -131,6 +131,19 @@ struct brand_ops {
 	boolean_t (*b_wait_filter)(proc_t *, proc_t *);
 	boolean_t (*b_native_exec)(uint8_t, const char **);
 	void (*b_ptrace_exectrap)(proc_t *);
+	uint32_t (*b_map32limit)(proc_t *);
+	void	(*b_stop_notify)(proc_t *, klwp_t *, ushort_t, ushort_t);
+	int	(*b_waitid_helper)(idtype_t, id_t, k_siginfo_t *, int,
+	    boolean_t *, int *);
+	int	(*b_sigcld_repost)(proc_t *, sigqueue_t *);
+	int	(*b_issig_stop)(proc_t *, klwp_t *);
+	void	(*b_savecontext)(ucontext_t *);
+#if defined(_SYSCALL32_IMPL)
+	void	(*b_savecontext32)(ucontext32_t *);
+#endif
+	void	(*b_restorecontext)(ucontext_t *);
+	caddr_t	(*b_sendsig_stack)(int);
+	void	(*b_sendsig)(int);
 };
 
 /*
@@ -186,7 +199,7 @@ extern void	brand_solaris_copy_procdata(proc_t *, proc_t *,
 		    struct brand *);
 extern int	brand_solaris_elfexec(vnode_t *, execa_t *, uarg_t *,
 		    intpdata_t *, int, long *, int, caddr_t, cred_t *, int,
-		    struct brand *, char *, char *, char *, char *, char *);
+		    struct brand *, char *, char *, char *);
 extern void	brand_solaris_exec(struct brand *);
 extern int	brand_solaris_fini(char **, struct modlinkage *,
 		    struct brand *);

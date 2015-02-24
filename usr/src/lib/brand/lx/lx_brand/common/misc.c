@@ -21,9 +21,10 @@
 /*
  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
- * Copyright 2014 Joyent, Inc.  All rights reserved.
+ * Copyright 2015 Joyent, Inc.  All rights reserved.
  */
 
+#include <stdlib.h>
 #include <assert.h>
 #include <alloca.h>
 #include <errno.h>
@@ -47,11 +48,16 @@
 #include <sys/lx_syscall.h>
 #include <sys/lx_thunk_server.h>
 #include <sys/lx_fcntl.h>
+#include <sys/lx_thread.h>
 #include <sys/inotify.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <thread.h>
 #include <unistd.h>
 #include <libintl.h>
 #include <zone.h>
+#include <priv.h>
+#include <lx_syscall.h>
 
 extern int sethostname(char *, int);
 
@@ -245,7 +251,7 @@ lx_uname(uintptr_t p1)
 
 /*
  * {get,set}groups16() - Handle the conversion between 16-bit Linux gids and
- * 32-bit Solaris gids.
+ * 32-bit illumos gids.
  */
 long
 lx_getgroups16(uintptr_t p1, uintptr_t p2)
@@ -259,11 +265,15 @@ lx_getgroups16(uintptr_t p1, uintptr_t p2)
 	if (count < 0)
 		return (-EINVAL);
 
-	grouplist32 = SAFE_ALLOCA(count * sizeof (gid_t));
-	if (grouplist32 == NULL && count > 0)
+	grouplist32 = malloc(count * sizeof (gid_t));
+	if (grouplist32 == NULL && count > 0) {
+		free(grouplist32);
 		return (-ENOMEM);
-	if ((ret = getgroups(count, grouplist32)) < 0)
+	}
+	if ((ret = getgroups(count, grouplist32)) < 0) {
+		free(grouplist32);
 		return (-errno);
+	}
 
 	/* we must not modify the list if the incoming count was 0 */
 	if (count > 0) {
@@ -271,49 +281,102 @@ lx_getgroups16(uintptr_t p1, uintptr_t p2)
 			grouplist[i] = LX_GID32_TO_GID16(grouplist32[i]);
 	}
 
+	free(grouplist32);
 	return (ret);
 }
 
 long
 lx_setgroups16(uintptr_t p1, uintptr_t p2)
 {
+	long rv;
 	int count = (int)p1;
-	lx_gid16_t *grouplist = (lx_gid16_t *)p2;
-	gid_t *grouplist32;
+	lx_gid16_t *grouplist = NULL;
+	gid_t *grouplist32 = NULL;
 	int i;
 
-	grouplist32 = SAFE_ALLOCA(count * sizeof (gid_t));
-	if (grouplist32 == NULL)
+	if ((grouplist = malloc(count * sizeof (lx_gid16_t))) == NULL) {
 		return (-ENOMEM);
+	}
+	if (uucopy((void *)p2, grouplist, count * sizeof (lx_gid16_t)) != 0) {
+		free(grouplist);
+		return (-EFAULT);
+	}
+
+	grouplist32 = malloc(count * sizeof (gid_t));
+	if (grouplist32 == NULL) {
+		free(grouplist);
+		return (-ENOMEM);
+	}
 	for (i = 0; i < count; i++)
 		grouplist32[i] = LX_GID16_TO_GID32(grouplist[i]);
 
 	/* order matters here to get the correct errno back */
-	if (count > NGROUPS_MAX_DEFAULT)
+	if (count > NGROUPS_MAX_DEFAULT) {
+		free(grouplist);
+		free(grouplist32);
 		return (-EINVAL);
+	}
 
-	return (setgroups(count, grouplist32) ? -errno : 0);
+	rv = setgroups(count, grouplist32);
+
+	free(grouplist);
+	free(grouplist32);
+
+	return (rv != 0 ? -errno : 0);
 }
 
 /*
- * personality() - Solaris doesn't support Linux personalities, but we have to
- * emulate enough to show that we support the basic personality.
+ * personality().  We don't really support Linux personalities, but we have to
+ * emulate enough (or ahem, lie) to show that we support the basic personality.
+ * We also allow certain (relatively) harmless bits of the personality to be
+ * "set" -- keeping track of whatever lie we're telling so we don't get caught
+ * out too easily.
  */
-#define	LX_PER_LINUX	0x0
+#define	LX_PER_LINUX			0x0
+#define	LX_PER_MASK			0xff
+
+/*
+ * These are for what Linux calls "bug emulation".
+ */
+#define	LX_PER_UNAME26			0x0020000
+#define	LX_PER_ADDR_NO_RANDOMIZE	0x0040000
+#define	LX_PER_FDPIC_FUNCPTRS		0x0080000
+#define	LX_PER_MMAP_PAGE_ZERO		0x0100000
+#define	LX_PER_ADDR_COMPAT_LAYOUT	0x0200000
+#define	LX_PER_READ_IMPLIES_EXEC	0x0400000
+#define	LX_PER_ADDR_LIMIT_32BIT		0x0800000
+#define	LX_PER_SHORT_INODE		0x1000000
+#define	LX_PER_WHOLE_SECONDS		0x2000000
+#define	LX_PER_STICKY_TIMEOUTS		0x4000000
+#define	LX_PER_ADDR_LIMIT_3GB		0x8000000
 
 long
 lx_personality(uintptr_t p1)
 {
+	static int current = LX_PER_LINUX;
 	int per = (int)p1;
 
 	switch (per) {
 	case -1:
 		/* Request current personality */
-		return (LX_PER_LINUX);
+		return (current);
 	case LX_PER_LINUX:
+		current = per;
 		return (0);
 	default:
-		return (-EINVAL);
+		if (per & LX_PER_MASK)
+			return (-EINVAL);
+
+		/*
+		 * We allow a subset of the legacy emulation personality
+		 * attributes to be "turned on" -- which we put in quotes
+		 * because we don't actually change our behavior based on
+		 * them.  (Note that we silently ignore the others.)
+		 */
+		current = per & (LX_PER_ADDR_LIMIT_3GB |
+		    LX_PER_ADDR_NO_RANDOMIZE | LX_PER_ADDR_COMPAT_LAYOUT);
+
+		return (0);
 	}
 }
 
@@ -368,10 +431,10 @@ lx_mknod(uintptr_t p1, uintptr_t p2, uintptr_t p3)
 		 *
 		 * Most programmers aren't even aware you can do this.
 		 *
-		 * Note you can also do this via Solaris' mknod(2), but
+		 * Note you can also do this via illumos' mknod(2), but
 		 * Linux allows anyone who can create a UNIX domain
 		 * socket via bind(2) to create one via mknod(2);
-		 * Solaris requires the caller to be privileged.
+		 * illumos requires the caller to be privileged.
 		 */
 		if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
 			return (-errno);
@@ -452,19 +515,6 @@ lx_setdomainname(uintptr_t p1, uintptr_t p2)
 }
 
 long
-lx_getpid(void)
-{
-	int pid;
-
-	/* First call the thunk server hook. */
-	if (lxt_server_pid(&pid) != 0)
-		return (pid);
-
-	pid = syscall(SYS_brand, B_IKE_SYSCALL + LX_EMUL_getpid);
-	return ((pid == -1) ? -errno : pid);
-}
-
-long
 lx_execve(uintptr_t p1, uintptr_t p2, uintptr_t p3)
 {
 	char *filename = (char *)p1;
@@ -501,7 +551,11 @@ lx_execve(uintptr_t p1, uintptr_t p2, uintptr_t p3)
 	if (argv == NULL)
 		argv = nullist;
 
-	lx_ptrace_stop_if_option(LX_PTRACE_O_TRACEEXEC);
+	/*
+	 * Emulate PR_SET_KEEPCAPS which is reset on execve. If this is not done
+	 * the emulated capabilities could be reduced more than expected.
+	 */
+	(void) setpflags(PRIV_AWARE_RESET, 1);
 
 	/* This is a normal exec call. */
 	(void) execve(filename, argv, envp);
@@ -519,15 +573,17 @@ lx_setgroups(uintptr_t p1, uintptr_t p2)
 	lx_debug("\tlx_setgroups(%d, 0x%p", ng, p2);
 
 	if (ng > 0) {
-		if ((glist = (gid_t *)SAFE_ALLOCA(ng * sizeof (gid_t))) == NULL)
+		if ((glist = (gid_t *)malloc(ng * sizeof (gid_t))) == NULL)
 			return (-ENOMEM);
 
-		if (uucopy((void *)p2, glist, ng * sizeof (gid_t)) != 0)
+		if (uucopy((void *)p2, glist, ng * sizeof (gid_t)) != 0) {
+			free(glist);
 			return (-errno);
+		}
 
 		/*
 		 * Linux doesn't check the validity of the group IDs, but
-		 * Solaris does. Change any invalid group IDs to a known, valid
+		 * illumos does. Change any invalid group IDs to a known, valid
 		 * value (yuck).
 		 */
 		for (i = 0; i < ng; i++) {
@@ -537,12 +593,14 @@ lx_setgroups(uintptr_t p1, uintptr_t p2)
 	}
 
 	/* order matters here to get the correct errno back */
-	if (ng > NGROUPS_MAX_DEFAULT)
+	if (ng > NGROUPS_MAX_DEFAULT) {
+		free(glist);
 		return (-EINVAL);
+	}
 
-	r = syscall(SYS_brand, B_IKE_SYSCALL + LX_EMUL_setgroups,
-	    ng, glist);
+	r = syscall(SYS_brand, B_HELPER_SETGROUPS, ng, glist);
 
+	free(glist);
 	return ((r == -1) ? -errno : r);
 }
 
@@ -559,11 +617,31 @@ lx_prctl(int option, uintptr_t arg2, uintptr_t arg3,
 	size_t psargslen = sizeof (psinfo.pr_psargs);
 	int fd;
 
+	if (option == LX_PR_GET_DUMPABLE) {
+		/* Indicate that process is always dumpable */
+		return (1);
+	}
+
+	if (option == LX_PR_SET_DUMPABLE) {
+		if (arg2 != 1 && arg2 != 0)
+			return (-EINVAL);
+		/* Lie about altering process dumpability */
+		return (0);
+	}
+
 	if (option == LX_PR_SET_KEEPCAPS) {
 		/*
-		 * See lx_capget and lx_capset. We totally punt on capabilities
-		 * so do the same here.
+		 * The closest illumos analog to SET_KEEPCAPS is the PRIV_AWARE
+		 * flag.  There are probably some cases where it's not exactly
+		 * the same, but this will do for a first try.
 		 */
+		if (arg2 == 0) {
+			if (setpflags(PRIV_AWARE_RESET, 1) != 0)
+				return (-errno);
+		} else {
+			if (setpflags(PRIV_AWARE, 1) != 0)
+				return (-errno);
+		}
 		return (0);
 	}
 
@@ -754,6 +832,28 @@ lx_fchmod(int fildes, mode_t mode)
 	return ((r == -1) ? -errno : r);
 }
 
+/*
+ * We support neither the second argument (NUMA node), nor the third (obsolete
+ * pre-2.6.24 caching functionality which was ultimately broken).
+ */
+long
+lx_getcpu(unsigned int *cpu, uintptr_t p2, uintptr_t p3)
+{
+	psinfo_t psinfo;
+	int procfd;
+	unsigned int curcpu;
+
+	if ((procfd = open("/native/proc/self/psinfo", O_RDONLY)) == -1)
+		return (-errno);
+
+	if (read(procfd, &psinfo, sizeof (psinfo_t)) == -1)
+		return (-errno);
+
+	curcpu = psinfo.pr_lwp.pr_onpro;
+
+	return ((uucopy(&curcpu, cpu, sizeof (curcpu)) != 0) ? -errno : 0);
+}
+
 long
 lx_getgid(void)
 {
@@ -841,6 +941,15 @@ lx_mincore(caddr_t addr, size_t len, char *vec)
 	int r;
 
 	r = mincore(addr, len, vec);
+	if (r == -1 && errno == EINVAL) {
+		/*
+		 * LTP mincore01 expects mincore with a huge len to fail with
+		 * ENOMEM on a modern kernel but on Linux 2.6.11 and earlier it
+		 * returns EINVAL.
+		 */
+		if (strcmp(lx_release, "2.6.11") > 0 && (long)len < 0)
+			errno = ENOMEM;
+	}
 	return ((r == -1) ? -errno : r);
 }
 
@@ -971,18 +1080,67 @@ lx_utimes(const char *path, const struct timeval times[2])
 }
 
 long
-lx_write(int fildes, const void *buf, size_t nbyte)
+lx_vhangup(void)
 {
-	int r;
+	if (geteuid() != 0)
+		return (-EPERM);
 
-	r = write(fildes, buf, nbyte);
-	return ((r == -1) ? -errno : r);
+	vhangup();
+
+	return (0);
 }
 
 long
-lx_yield(void)
+lx_eventfd(unsigned int initval)
 {
+	return (lx_eventfd2(initval, 0));
+}
 
-	yield();
-	return (0);
+long
+lx_eventfd2(unsigned int initval, int flags)
+{
+	int r = eventfd(initval, flags);
+
+	/*
+	 * eventfd(3C) may fail with ENOENT if /dev/eventfd is not available.
+	 * It is less jarring to Linux programs to tell them that the system
+	 * call is not supported than to report an error number they are not
+	 * expecting.
+	 */
+	if (r == -1 && errno == ENOENT)
+		return (-ENOTSUP);
+
+	return (r == -1 ? -errno : r);
+}
+
+long
+lx_timerfd_create(int clockid, int flags)
+{
+	int r = timerfd_create(clockid, flags);
+
+	/*
+	 * As with the eventfd case, above, we return a slightly less jarring
+	 * error condition if we cannot open /dev/timerfd.
+	 */
+	if (r == -1 && errno == ENOENT)
+		return (-ENOTSUP);
+
+	return (r == -1 ? -errno : r);
+}
+
+long
+lx_timerfd_settime(int fd, int flags, const struct itimerspec *value,
+    struct itimerspec *ovalue)
+{
+	int r = timerfd_settime(fd, flags, value, ovalue);
+
+	return (r == -1 ? -errno : r);
+}
+
+long
+lx_timerfd_gettime(int fd, struct itimerspec *value)
+{
+	int r = timerfd_gettime(fd, value);
+
+	return (r == -1 ? -errno : r);
 }

@@ -21,7 +21,7 @@
 /*
  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
- * Copyright 2014 Joyent, Inc.  All rights reserved.
+ * Copyright 2015 Joyent, Inc.  All rights reserved.
  */
 
 /*
@@ -68,9 +68,23 @@
 #include <sys/param.h>
 #include <sys/utsname.h>
 #include <sys/rctl.h>
+#include <sys/kstat.h>
+#include <sys/lx_misc.h>
+#include <sys/cred_impl.h>
+#include <sys/tihdr.h>
+#include <inet/ip.h>
+#include <inet/ip_ire.h>
+#include <inet/ip6.h>
+#include <inet/ip_if.h>
+#include <inet/tcp.h>
+#include <inet/udp_impl.h>
+#include <inet/ipclassifier.h>
+#include <sys/socketvar.h>
+#include <fs/sockfs/socktpi.h>
 
 /* Dependent on procfs */
 extern kthread_t *prchoose(proc_t *);
+extern int prreadargv(proc_t *, char *, size_t, size_t *);
 
 #include "lx_proc.h"
 
@@ -96,6 +110,7 @@ static int lxpr_lookup(vnode_t *, char *, vnode_t **,
 static int lxpr_readdir(vnode_t *, uio_t *, cred_t *, int *,
     caller_context_t *, int);
 static int lxpr_readlink(vnode_t *, uio_t *, cred_t *, caller_context_t *);
+static int lxpr_readlink_pid_fd(lxpr_node_t *lxpnp, char *bp, size_t len);
 static int lxpr_cmp(vnode_t *, vnode_t *, caller_context_t *);
 static int lxpr_realvp(vnode_t *, vnode_t **, caller_context_t *);
 static int lxpr_sync(void);
@@ -132,6 +147,7 @@ static void lxpr_read_meminfo(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_mounts(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_partitions(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_stat(lxpr_node_t *, lxpr_uiobuf_t *);
+static void lxpr_read_swaps(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_uptime(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_version(lxpr_node_t *, lxpr_uiobuf_t *);
 
@@ -146,9 +162,11 @@ static void lxpr_read_pid_status(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_arp(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_dev(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_dev_mcast(lxpr_node_t *, lxpr_uiobuf_t *);
+static void lxpr_read_net_if_inet6(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_igmp(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_ip_mr_cache(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_ip_mr_vif(lxpr_node_t *, lxpr_uiobuf_t *);
+static void lxpr_read_net_ipv6_route(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_mcfilter(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_netstat(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_raw(lxpr_node_t *, lxpr_uiobuf_t *);
@@ -159,7 +177,9 @@ static void lxpr_read_net_sockstat(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_snmp(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_stat(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_tcp(lxpr_node_t *, lxpr_uiobuf_t *);
+static void lxpr_read_net_tcp6(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_udp(lxpr_node_t *, lxpr_uiobuf_t *);
+static void lxpr_read_net_udp6(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_net_unix(lxpr_node_t *, lxpr_uiobuf_t *);
 static void lxpr_read_sys_fs_inotify_max_queued_events(lxpr_node_t *,
     lxpr_uiobuf_t *);
@@ -183,6 +203,12 @@ static void lxpr_read_sys_kernel_threads_max(lxpr_node_t *, lxpr_uiobuf_t *);
 extern rctl_hndl_t rc_zone_msgmni;
 extern rctl_hndl_t rc_zone_shmmax;
 #define	FOURGB	4294967295
+
+/*
+ * The maximum length of the concatenation of argument vector strings we
+ * will return to the user via the branded procfs:
+ */
+int lxpr_maxargvlen = 4096;
 
 /*
  * The lx /proc vnode operations vector
@@ -226,6 +252,7 @@ static lxpr_dirent_t lx_procdir[] = {
 	{ LXPR_PARTITIONS,	"partitions" },
 	{ LXPR_SELF,		"self" },
 	{ LXPR_STAT,		"stat" },
+	{ LXPR_SWAPS,		"swaps" },
 	{ LXPR_SYSDIR,		"sys" },
 	{ LXPR_UPTIME,		"uptime" },
 	{ LXPR_VERSION,		"version" }
@@ -293,9 +320,11 @@ static lxpr_dirent_t netdir[] = {
 	{ LXPR_NET_ARP,		"arp" },
 	{ LXPR_NET_DEV,		"dev" },
 	{ LXPR_NET_DEV_MCAST,	"dev_mcast" },
+	{ LXPR_NET_IF_INET6,	"if_inet6" },
 	{ LXPR_NET_IGMP,	"igmp" },
 	{ LXPR_NET_IP_MR_CACHE,	"ip_mr_cache" },
 	{ LXPR_NET_IP_MR_VIF,	"ip_mr_vif" },
+	{ LXPR_NET_IPV6_ROUTE,	"ipv6_route" },
 	{ LXPR_NET_MCFILTER,	"mcfilter" },
 	{ LXPR_NET_NETSTAT,	"netstat" },
 	{ LXPR_NET_RAW,		"raw" },
@@ -306,7 +335,9 @@ static lxpr_dirent_t netdir[] = {
 	{ LXPR_NET_SNMP,	"snmp" },
 	{ LXPR_NET_STAT,	"stat" },
 	{ LXPR_NET_TCP,		"tcp" },
+	{ LXPR_NET_TCP6,	"tcp6" },
 	{ LXPR_NET_UDP,		"udp" },
+	{ LXPR_NET_UDP6,	"udp6" },
 	{ LXPR_NET_UNIX,	"unix" }
 };
 
@@ -472,9 +503,11 @@ static void (*lxpr_read_function[LXPR_NFILES])() = {
 	lxpr_read_net_arp,		/* /proc/net/arp	*/
 	lxpr_read_net_dev,		/* /proc/net/dev	*/
 	lxpr_read_net_dev_mcast,	/* /proc/net/dev_mcast	*/
+	lxpr_read_net_if_inet6,		/* /proc/net/if_inet6	*/
 	lxpr_read_net_igmp,		/* /proc/net/igmp	*/
 	lxpr_read_net_ip_mr_cache,	/* /proc/net/ip_mr_cache */
 	lxpr_read_net_ip_mr_vif,	/* /proc/net/ip_mr_vif	*/
+	lxpr_read_net_ipv6_route,	/* /proc/net/ipv6_route	*/
 	lxpr_read_net_mcfilter,		/* /proc/net/mcfilter	*/
 	lxpr_read_net_netstat,		/* /proc/net/netstat	*/
 	lxpr_read_net_raw,		/* /proc/net/raw	*/
@@ -485,11 +518,14 @@ static void (*lxpr_read_function[LXPR_NFILES])() = {
 	lxpr_read_net_snmp,		/* /proc/net/snmp	*/
 	lxpr_read_net_stat,		/* /proc/net/stat	*/
 	lxpr_read_net_tcp,		/* /proc/net/tcp	*/
+	lxpr_read_net_tcp6,		/* /proc/net/tcp6	*/
 	lxpr_read_net_udp,		/* /proc/net/udp	*/
+	lxpr_read_net_udp6,		/* /proc/net/udp6	*/
 	lxpr_read_net_unix,		/* /proc/net/unix	*/
 	lxpr_read_partitions,		/* /proc/partitions	*/
 	lxpr_read_invalid,		/* /proc/self		*/
 	lxpr_read_stat,			/* /proc/stat		*/
+	lxpr_read_swaps,		/* /proc/swaps		*/
 	lxpr_read_invalid,		/* /proc/sys		*/
 	lxpr_read_invalid,		/* /proc/sys/fs		*/
 	lxpr_read_invalid,		/* /proc/sys/fs/inotify	*/
@@ -545,9 +581,11 @@ static vnode_t *(*lxpr_lookup_function[LXPR_NFILES])() = {
 	lxpr_lookup_not_a_dir,		/* /proc/net/arp	*/
 	lxpr_lookup_not_a_dir,		/* /proc/net/dev	*/
 	lxpr_lookup_not_a_dir,		/* /proc/net/dev_mcast	*/
+	lxpr_lookup_not_a_dir,		/* /proc/net/if_inet6	*/
 	lxpr_lookup_not_a_dir,		/* /proc/net/igmp	*/
 	lxpr_lookup_not_a_dir,		/* /proc/net/ip_mr_cache */
 	lxpr_lookup_not_a_dir,		/* /proc/net/ip_mr_vif	*/
+	lxpr_lookup_not_a_dir,		/* /proc/net/ipv6_route	*/
 	lxpr_lookup_not_a_dir,		/* /proc/net/mcfilter	*/
 	lxpr_lookup_not_a_dir,		/* /proc/net/netstat	*/
 	lxpr_lookup_not_a_dir,		/* /proc/net/raw	*/
@@ -558,11 +596,14 @@ static vnode_t *(*lxpr_lookup_function[LXPR_NFILES])() = {
 	lxpr_lookup_not_a_dir,		/* /proc/net/snmp	*/
 	lxpr_lookup_not_a_dir,		/* /proc/net/stat	*/
 	lxpr_lookup_not_a_dir,		/* /proc/net/tcp	*/
+	lxpr_lookup_not_a_dir,		/* /proc/net/tcp6	*/
 	lxpr_lookup_not_a_dir,		/* /proc/net/udp	*/
+	lxpr_lookup_not_a_dir,		/* /proc/net/udp6	*/
 	lxpr_lookup_not_a_dir,		/* /proc/net/unix	*/
 	lxpr_lookup_not_a_dir,		/* /proc/partitions	*/
 	lxpr_lookup_not_a_dir,		/* /proc/self		*/
 	lxpr_lookup_not_a_dir,		/* /proc/stat		*/
+	lxpr_lookup_not_a_dir,		/* /proc/swaps		*/
 	lxpr_lookup_sysdir,		/* /proc/sys		*/
 	lxpr_lookup_sys_fsdir,		/* /proc/sys/fs		*/
 	lxpr_lookup_sys_fs_inotifydir,	/* /proc/sys/fs/inotify	*/
@@ -618,9 +659,11 @@ static int (*lxpr_readdir_function[LXPR_NFILES])() = {
 	lxpr_readdir_not_a_dir,		/* /proc/net/arp	*/
 	lxpr_readdir_not_a_dir,		/* /proc/net/dev	*/
 	lxpr_readdir_not_a_dir,		/* /proc/net/dev_mcast	*/
+	lxpr_readdir_not_a_dir,		/* /proc/net/if_inet6	*/
 	lxpr_readdir_not_a_dir,		/* /proc/net/igmp	*/
 	lxpr_readdir_not_a_dir,		/* /proc/net/ip_mr_cache */
 	lxpr_readdir_not_a_dir,		/* /proc/net/ip_mr_vif	*/
+	lxpr_readdir_not_a_dir,		/* /proc/net/ipv6_route	*/
 	lxpr_readdir_not_a_dir,		/* /proc/net/mcfilter	*/
 	lxpr_readdir_not_a_dir,		/* /proc/net/netstat	*/
 	lxpr_readdir_not_a_dir,		/* /proc/net/raw	*/
@@ -631,11 +674,14 @@ static int (*lxpr_readdir_function[LXPR_NFILES])() = {
 	lxpr_readdir_not_a_dir,		/* /proc/net/snmp	*/
 	lxpr_readdir_not_a_dir,		/* /proc/net/stat	*/
 	lxpr_readdir_not_a_dir,		/* /proc/net/tcp	*/
+	lxpr_readdir_not_a_dir,		/* /proc/net/tcp6	*/
 	lxpr_readdir_not_a_dir,		/* /proc/net/udp	*/
+	lxpr_readdir_not_a_dir,		/* /proc/net/udp6	*/
 	lxpr_readdir_not_a_dir,		/* /proc/net/unix	*/
 	lxpr_readdir_not_a_dir,		/* /proc/partitions	*/
 	lxpr_readdir_not_a_dir,		/* /proc/self		*/
 	lxpr_readdir_not_a_dir,		/* /proc/stat		*/
+	lxpr_readdir_not_a_dir,		/* /proc/swaps		*/
 	lxpr_readdir_sysdir,		/* /proc/sys		*/
 	lxpr_readdir_sys_fsdir,		/* /proc/sys/fs		*/
 	lxpr_readdir_sys_fs_inotifydir,	/* /proc/sys/fs/inotify	*/
@@ -745,33 +791,34 @@ lxpr_read_empty(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 }
 
 /*
- * lxpr_read_pid_cmdline():
- *
- * This is not precisely compatible with Linux: the Linux cmdline returns argv
- * with the correct separation using \0 between the arguments, but we cannot do
- * that without copying the real argv from the correct process context.  This
- * is too difficult to attempt so we pretend that the entire cmdline is just
- * argv[0]. This is good enough for ps and htop to display correctly, but might
- * cause some other things not to work correctly.
+ * lxpr_read_pid_cmdline(): read argument vector from process
  */
 static void
 lxpr_read_pid_cmdline(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
 	proc_t *p;
 	char *buf;
+	size_t asz = lxpr_maxargvlen, sz;
 
 	ASSERT(lxpnp->lxpr_type == LXPR_PID_CMDLINE);
+
+	buf = kmem_alloc(asz, KM_SLEEP);
 
 	p = lxpr_lock(lxpnp->lxpr_pid);
 	if (p == NULL) {
 		lxpr_uiobuf_seterr(uiobuf, EINVAL);
+		kmem_free(buf, asz);
 		return;
 	}
 
-	buf = PTOU(p)->u_argv != 0 ? PTOU(p)->u_psargs : PTOU(p)->u_comm;
+	if (prreadargv(p, buf, asz, &sz) != 0) {
+		lxpr_uiobuf_seterr(uiobuf, EINVAL);
+	} else {
+		lxpr_uiobuf_write(uiobuf, buf, sz);
+	}
 
-	lxpr_uiobuf_write(uiobuf, buf, strlen(buf) + 1);
 	lxpr_unlock(p);
+	kmem_free(buf, asz);
 }
 
 /*
@@ -855,11 +902,11 @@ lxpr_read_pid_maps(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 	char *buf;
 	int buflen = MAXPATHLEN;
 	struct print_data {
-		caddr_t saddr;
-		caddr_t eaddr;
+		uintptr_t saddr;
+		uintptr_t eaddr;
 		int type;
 		char prot[5];
-		uint32_t offset;
+		uintptr_t offset;
 		vnode_t *vp;
 		struct print_data *next;
 	} *print_head = NULL;
@@ -891,8 +938,8 @@ lxpr_read_pid_maps(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 
 		pbuf = kmem_alloc(sizeof (*pbuf), KM_SLEEP);
 
-		pbuf->saddr = seg->s_base;
-		pbuf->eaddr = seg->s_base+seg->s_size;
+		pbuf->saddr = (uintptr_t)seg->s_base;
+		pbuf->eaddr = pbuf->saddr + seg->s_size;
 		pbuf->type = SEGOP_GETTYPE(seg, seg->s_base);
 
 		/*
@@ -917,7 +964,7 @@ lxpr_read_pid_maps(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 			pbuf->vp = NULL;
 		}
 
-		pbuf->offset = (uint32_t)SEGOP_GETOFFSET(seg, pbuf->saddr);
+		pbuf->offset = SEGOP_GETOFFSET(seg, (caddr_t)pbuf->saddr);
 
 		pbuf->next = NULL;
 		*print_tail = pbuf;
@@ -937,7 +984,7 @@ lxpr_read_pid_maps(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 
 		int maj = 0;
 		int min = 0;
-		u_longlong_t inode = 0;
+		ino_t inode = 0;
 
 		*buf = '\0';
 		if (pbuf->vp != NULL) {
@@ -952,16 +999,17 @@ lxpr_read_pid_maps(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 			VN_RELE(pbuf->vp);
 		}
 
-		if (*buf != '\0') {
+		if (p->p_model == DATAMODEL_LP64) {
 			lxpr_uiobuf_printf(uiobuf,
-			    "%08x-%08x %s %08x %02d:%03d %lld %s\n",
+			    "%08llx-%08llx %s %08llx %02x:%02x %llu%s%s\n",
 			    pbuf->saddr, pbuf->eaddr, pbuf->prot, pbuf->offset,
-			    maj, min, inode, buf);
+			    maj, min, inode, *buf != '\0' ? " " : "", buf);
 		} else {
 			lxpr_uiobuf_printf(uiobuf,
-			    "%08x-%08x %s %08x %02d:%03d %lld\n",
-			    pbuf->saddr, pbuf->eaddr, pbuf->prot, pbuf->offset,
-			    maj, min, inode);
+			    "%08x-%08x %s %08x %02x:%02x %llu%s%s\n",
+			    (uint32_t)pbuf->saddr, (uint32_t)pbuf->eaddr,
+			    pbuf->prot, (uint32_t)pbuf->offset, maj, min,
+			    inode, *buf != '\0' ? " " : "", buf);
 		}
 
 		pbuf_next = pbuf->next;
@@ -1240,11 +1288,14 @@ lxpr_read_pid_status(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 
 	/*
 	 * Convert pid to the Linux default of 1 if we're the zone's init
-	 * process
+	 * process or if we're the zone's zsched the pid is 0.
 	 */
 	if (pid == curproc->p_zone->zone_proc_initpid) {
 		pid = 1;
 		ppid = 0;	/* parent pid for init is 0 */
+	} else if (pid == curproc->p_zone->zone_zsched->p_pid) {
+		pid = 0;	/* zsched is pid 0 */
+		ppid = 0;	/* parent pid for zsched is itself */
 	} else {
 		/*
 		 * Make sure not to reference parent PIDs that reside outside
@@ -1432,6 +1483,13 @@ lxpr_read_pid_stat(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 		psgid = (gid_t)-1;	/* credential GID for init is -1 */
 		spid = 0;		/* session id for init is 0 */
 		psdev = 0;		/* session device for init is 0 */
+	} else if (pid == curproc->p_zone->zone_zsched->p_pid) {
+		pid = 0;		/* PID for zsched */
+		ppid = 0;		/* parent PID for zsched is 0 */
+		pgpid = 0;		/* process group for zsched is 0 */
+		psgid = (gid_t)-1;	/* credential GID for zsched is -1 */
+		spid = 0;		/* session id for zsched is 0 */
+		psdev = 0;		/* session device for zsched is 0 */
 	} else {
 		/*
 		 * Make sure not to reference parent PIDs that reside outside
@@ -1541,27 +1599,236 @@ lxpr_read_net_arp(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
 }
 
+struct lxpr_ifstat {
+	uint64_t rx_bytes;
+	uint64_t rx_packets;
+	uint64_t rx_errors;
+	uint64_t rx_drop;
+	uint64_t tx_bytes;
+	uint64_t tx_packets;
+	uint64_t tx_errors;
+	uint64_t tx_drop;
+	uint64_t collisions;
+	uint64_t rx_multicast;
+};
+
+static void *
+lxpr_kstat_read(kstat_t *kn, boolean_t byname, size_t *size, int *num)
+{
+	kstat_t *kp;
+	int i, nrec = 0;
+	size_t bufsize;
+	void *buf = NULL;
+
+	if (byname == B_TRUE)
+		kp = kstat_hold_byname(kn->ks_module, kn->ks_instance,
+		    kn->ks_name, getzoneid());
+	else
+		kp = kstat_hold_bykid(kn->ks_kid, getzoneid());
+	if (kp == NULL)
+		return (NULL);
+	if (kp->ks_flags & KSTAT_FLAG_INVALID) {
+		kstat_rele(kp);
+		return (NULL);
+	}
+
+	bufsize = kp->ks_data_size + 1;
+	kstat_rele(kp);
+
+	/*
+	 * The kstat in question is released so that kmem_alloc(KM_SLEEP) is
+	 * performed without it held.  After the alloc, the kstat is reacquired
+	 * and its size is checked again. If the buffer is no longer large
+	 * enough, the alloc and check are repeated up to three times.
+	 */
+	for (i = 0; i < 2; i++) {
+		buf = kmem_alloc(bufsize, KM_SLEEP);
+
+		/* Check if bufsize still appropriate */
+		if (byname == B_TRUE)
+			kp = kstat_hold_byname(kn->ks_module, kn->ks_instance,
+			    kn->ks_name, getzoneid());
+		else
+			kp = kstat_hold_bykid(kn->ks_kid, getzoneid());
+		if (kp == NULL || kp->ks_flags & KSTAT_FLAG_INVALID) {
+			if (kp != NULL)
+				kstat_rele(kp);
+			kmem_free(buf, bufsize);
+			return (NULL);
+		}
+		KSTAT_ENTER(kp);
+		(void) KSTAT_UPDATE(kp, KSTAT_READ);
+		if (bufsize < kp->ks_data_size) {
+			kmem_free(buf, bufsize);
+			bufsize = kp->ks_data_size + 1;
+			KSTAT_EXIT(kp);
+			kstat_rele(kp);
+			continue;
+		} else {
+			if (KSTAT_SNAPSHOT(kp, buf, KSTAT_READ) != 0) {
+				kmem_free(buf, bufsize);
+				buf = NULL;
+			}
+			nrec = kp->ks_ndata;
+			KSTAT_EXIT(kp);
+			kstat_rele(kp);
+			break;
+		}
+	}
+
+	if (buf != NULL) {
+		*size = bufsize;
+		*num = nrec;
+	}
+	return (buf);
+}
+
+static int
+lxpr_kstat_ifstat(kstat_t *kn, struct lxpr_ifstat *ifs)
+{
+	kstat_named_t *kp;
+	int i, num;
+	size_t size;
+
+	/*
+	 * Search by name instead of by kid since there's a small window to
+	 * race against kstats being added/removed.
+	 */
+	bzero(ifs, sizeof (*ifs));
+	kp = (kstat_named_t *)lxpr_kstat_read(kn, B_TRUE, &size, &num);
+	if (kp == NULL)
+		return (-1);
+	for (i = 0; i < num; i++) {
+		if (strncmp(kp[i].name, "rbytes64", KSTAT_STRLEN) == 0)
+			ifs->rx_bytes = kp[i].value.ui64;
+		else if (strncmp(kp[i].name, "ipackets64", KSTAT_STRLEN) == 0)
+			ifs->rx_packets = kp[i].value.ui64;
+		else if (strncmp(kp[i].name, "ierrors", KSTAT_STRLEN) == 0)
+			ifs->rx_errors = kp[i].value.ui32;
+		else if (strncmp(kp[i].name, "norcvbuf", KSTAT_STRLEN) == 0)
+			ifs->rx_drop = kp[i].value.ui32;
+		else if (strncmp(kp[i].name, "multircv", KSTAT_STRLEN) == 0)
+			ifs->rx_multicast = kp[i].value.ui32;
+		else if (strncmp(kp[i].name, "obytes64", KSTAT_STRLEN) == 0)
+			ifs->tx_bytes = kp[i].value.ui64;
+		else if (strncmp(kp[i].name, "opackets64", KSTAT_STRLEN) == 0)
+			ifs->tx_packets = kp[i].value.ui64;
+		else if (strncmp(kp[i].name, "oerrors", KSTAT_STRLEN) == 0)
+			ifs->tx_errors = kp[i].value.ui32;
+		else if (strncmp(kp[i].name, "noxmtbuf", KSTAT_STRLEN) == 0)
+			ifs->tx_drop = kp[i].value.ui32;
+		else if (strncmp(kp[i].name, "collisions", KSTAT_STRLEN) == 0)
+			ifs->collisions = kp[i].value.ui32;
+	}
+	kmem_free(kp, size);
+	return (0);
+}
+
 /* ARGSUSED */
 static void
 lxpr_read_net_dev(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
+	kstat_t *ksr;
+	kstat_t ks0;
+	int i, nidx;
+	size_t sidx;
+	struct lxpr_ifstat ifs;
+
 	lxpr_uiobuf_printf(uiobuf, "Inter-|   Receive                   "
 	    "                             |  Transmit\n");
 	lxpr_uiobuf_printf(uiobuf, " face |bytes    packets errs drop fifo"
 	    " frame compressed multicast|bytes    packets errs drop fifo"
 	    " colls carrier compressed\n");
 
-	/*
-	 * Data about each interface should go here, but that shouldn't be added
-	 * unless there is an lxproc reader that actually makes use of it (and
-	 * doesn't need anything else that we refuse to provide)...
-	 */
+	ks0.ks_kid = 0;
+	ksr = (kstat_t *)lxpr_kstat_read(&ks0, B_FALSE, &sidx, &nidx);
+	if (ksr == NULL)
+		return;
+
+	for (i = 1; i < nidx; i++) {
+		if (strncmp(ksr[i].ks_module, "link", KSTAT_STRLEN) == 0 ||
+		    strncmp(ksr[i].ks_module, "lo", KSTAT_STRLEN) == 0) {
+			if (lxpr_kstat_ifstat(&ksr[i], &ifs) != 0)
+				continue;
+
+			/* Overwriting the name is ok in the local snapshot */
+			lx_ifname_convert(ksr[i].ks_name, LX_IFNAME_FROMNATIVE);
+			lxpr_uiobuf_printf(uiobuf, "%6s: %7llu %7llu %4lu "
+			    "%4lu %4u %5u %10u %9lu %8llu %7llu %4lu %4lu %4u "
+			    "%5lu %7u %10u\n",
+			    ksr[i].ks_name,
+			    ifs.rx_bytes, ifs.rx_packets,
+			    ifs.rx_errors, ifs.rx_drop,
+			    0, 0, 0, ifs.rx_multicast,
+			    ifs.tx_bytes, ifs.tx_packets,
+			    ifs.tx_errors, ifs.tx_drop,
+			    0, ifs.collisions, 0, 0);
+		}
+	}
+
+	kmem_free(ksr, sidx);
 }
 
 /* ARGSUSED */
 static void
 lxpr_read_net_dev_mcast(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
+}
+
+static void
+lxpr_inet6_out(const in6_addr_t *addr, char buf[33])
+{
+	const uint8_t *ip = addr->s6_addr;
+	char digits[] = "0123456789abcdef";
+	int i;
+	for (i = 0; i < 16; i++) {
+		buf[2 * i] = digits[ip[i] >> 4];
+		buf[2 * i + 1] = digits[ip[i] & 0xf];
+	}
+	buf[32] = '\0';
+}
+
+/* ARGSUSED */
+static void
+lxpr_read_net_if_inet6(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
+{
+	netstack_t *ns;
+	ip_stack_t *ipst;
+	ill_t *ill;
+	ipif_t *ipif;
+	ill_walk_context_t	ctx;
+	char ifname[LIFNAMSIZ], ip6out[33];
+
+	ns = netstack_get_current();
+	if (ns == NULL)
+		return;
+	ipst = ns->netstack_ip;
+
+	rw_enter(&ipst->ips_ill_g_lock, RW_READER);
+	ill = ILL_START_WALK_V6(&ctx, ipst);
+
+	for (; ill != NULL; ill = ill_next(&ctx, ill)) {
+		for (ipif = ill->ill_ipif; ipif != NULL;
+		    ipif = ipif->ipif_next) {
+			uint_t index = ill->ill_phyint->phyint_ifindex;
+			int plen = ip_mask_to_plen_v6(&ipif->ipif_v6net_mask);
+			in6addr_scope_t scope = ip_addr_scope_v6(
+			    &ipif->ipif_v6lcl_addr);
+			/* Always report PERMANENT flag */
+			int flag = 0x80;
+
+			ipif_get_name(ipif, ifname, sizeof (ifname));
+			lx_ifname_convert(ifname, LX_IFNAME_FROMNATIVE);
+			lxpr_inet6_out(&ipif->ipif_v6lcl_addr, ip6out);
+			/* Scope output is shifted on Linux */
+			scope = scope << 4;
+
+			lxpr_uiobuf_printf(uiobuf, "%32s %02x %02x %02x %02x"
+			    " %8s\n", ip6out, index, plen, scope, flag, ifname);
+		}
+	}
+	rw_exit(&ipst->ips_ill_g_lock);
+	netstack_rele(ns);
 }
 
 /* ARGSUSED */
@@ -1582,6 +1849,66 @@ lxpr_read_net_ip_mr_vif(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
 }
 
+static void
+lxpr_format_route_ipv6(ire_t *ire, lxpr_uiobuf_t *uiobuf)
+{
+	uint32_t flags;
+	char name[IFNAMSIZ];
+	char ipv6addr[33];
+
+	lxpr_inet6_out(&ire->ire_addr_v6, ipv6addr);
+	lxpr_uiobuf_printf(uiobuf, "%s %02x ", ipv6addr,
+	    ip_mask_to_plen_v6(&ire->ire_mask_v6));
+
+	/* punt on this for now */
+	lxpr_uiobuf_printf(uiobuf, "%s %02x ",
+	    "00000000000000000000000000000000", 0);
+
+	lxpr_inet6_out(&ire->ire_gateway_addr_v6, ipv6addr);
+	lxpr_uiobuf_printf(uiobuf, "%s", ipv6addr);
+
+	flags = ire->ire_flags &
+	    (RTF_UP|RTF_GATEWAY|RTF_HOST|RTF_DYNAMIC|RTF_MODIFIED);
+	/* Linux's RTF_LOCAL equivalent */
+	if (ire->ire_metrics.iulp_local)
+		flags |= 0x80000000;
+
+	if (ire->ire_ill != NULL) {
+		ill_get_name(ire->ire_ill, name, sizeof (name));
+		lx_ifname_convert(name, LX_IFNAME_FROMNATIVE);
+	} else {
+		name[0] = '\0';
+	}
+
+	lxpr_uiobuf_printf(uiobuf, " %08x %08x %08x %08x %8s\n",
+	    0, /* metric */
+	    ire->ire_refcnt,
+	    0,
+	    flags,
+	    name);
+}
+
+/* ARGSUSED */
+static void
+lxpr_read_net_ipv6_route(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
+{
+	netstack_t *ns;
+	ip_stack_t *ipst;
+
+	ns = netstack_get_current();
+	if (ns == NULL)
+		return;
+	ipst = ns->netstack_ip;
+
+	/*
+	 * LX branded zones are expected to have exclusive IP stack, hence
+	 * using ALL_ZONES as the zoneid filter.
+	 */
+	ire_walk_v6(&lxpr_format_route_ipv6, uiobuf, ALL_ZONES, ipst);
+
+	netstack_rele(ns);
+}
+
 /* ARGSUSED */
 static void
 lxpr_read_net_mcfilter(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
@@ -1600,10 +1927,97 @@ lxpr_read_net_raw(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
 }
 
+#define	LXPR_SKIP_ROUTE(type)	\
+	(((IRE_IF_CLONE | IRE_BROADCAST | IRE_MULTICAST | \
+	IRE_NOROUTE | IRE_LOOPBACK | IRE_LOCAL) & type) != 0)
+
+static void
+lxpr_format_route_ipv4(ire_t *ire, lxpr_uiobuf_t *uiobuf)
+{
+	uint32_t flags;
+	char name[IFNAMSIZ];
+	ill_t *ill;
+	ire_t *nire;
+	ipif_t *ipif;
+	ipaddr_t gateway;
+
+	if (LXPR_SKIP_ROUTE(ire->ire_type) || ire->ire_testhidden != 0)
+		return;
+
+	/* These route flags have direct Linux equivalents */
+	flags = ire->ire_flags &
+	    (RTF_UP|RTF_GATEWAY|RTF_HOST|RTF_DYNAMIC|RTF_MODIFIED);
+
+	/*
+	 * Search for a suitable IRE for naming purposes.
+	 * On Linux, the default route is typically associated with the
+	 * interface used to access gateway.  The default IRE on Illumos
+	 * typically lacks an ill reference but its parent might have one.
+	 */
+	nire = ire;
+	do {
+		ill = nire->ire_ill;
+		nire = nire->ire_dep_parent;
+	} while (ill == NULL && nire != NULL);
+	if (ill != NULL) {
+		ill_get_name(ill, name, sizeof (name));
+		lx_ifname_convert(name, LX_IFNAME_FROMNATIVE);
+	} else {
+		name[0] = '*';
+		name[1] = '\0';
+	}
+
+	/*
+	 * Linux suppresses the gateway address for directly connected
+	 * interface networks.  To emulate this behavior, we walk all addresses
+	 * of a given route interface.  If one matches the gateway, it is
+	 * displayed as NULL.
+	 */
+	gateway = ire->ire_gateway_addr;
+	if ((ill = ire->ire_ill) != NULL) {
+		for (ipif = ill->ill_ipif; ipif != NULL;
+		    ipif = ipif->ipif_next) {
+			if (ipif->ipif_lcl_addr == gateway) {
+				gateway = 0;
+				break;
+			}
+		}
+	}
+
+	lxpr_uiobuf_printf(uiobuf, "%s\t%08X\t%08X\t%04X\t%d\t%u\t"
+	    "%d\t%08X\t%d\t%u\t%u\n",
+	    name,
+	    ire->ire_addr,
+	    gateway,
+	    flags, 0, 0,
+	    0, /* priority */
+	    ire->ire_mask,
+	    0, 0, /* mss, window */
+	    ire->ire_metrics.iulp_rtt);
+}
+
 /* ARGSUSED */
 static void
 lxpr_read_net_route(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
+	netstack_t *ns;
+	ip_stack_t *ipst;
+
+	lxpr_uiobuf_printf(uiobuf, "Iface\tDestination\tGateway \tFlags\t"
+	    "RefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
+
+	ns = netstack_get_current();
+	if (ns == NULL)
+		return;
+	ipst = ns->netstack_ip;
+
+	/*
+	 * LX branded zones are expected to have exclusive IP stack, hence
+	 * using ALL_ZONES as the zoneid filter.
+	 */
+	ire_walk_v4(&lxpr_format_route_ipv4, uiobuf, ALL_ZONES, ipst);
+
+	netstack_rele(ns);
 }
 
 /* ARGSUSED */
@@ -1624,10 +2038,146 @@ lxpr_read_net_sockstat(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
 }
 
+typedef struct lxpr_snmp_table {
+	const char *lst_proto;
+	const char *lst_fields[];
+} lxpr_snmp_table_t;
+
+static lxpr_snmp_table_t lxpr_snmp_ip = { "ip",
+	{
+	"forwarding", "defaultTTL", "inReceives", "inHdrErrors",
+	"inAddrErrors", "forwDatagrams", "inUnknownProtos", "inDiscards",
+	"inDelivers", "outRequests", "outDiscards", "outNoRoutes",
+	"reasmTimeout", "reasmReqds", "reasmOKs", "reasmFails", "fragOKs",
+	"fragFails", "fragCreates",
+	NULL
+	}
+};
+static lxpr_snmp_table_t lxpr_snmp_icmp = { "icmp",
+	{
+	"inMsgs", "inErrors", "inCsumErrors", "inDestUnreachs", "inTimeExcds",
+	"inParmProbs", "inSrcQuenchs", "inRedirects", "inEchos", "inEchoReps",
+	"inTimestamps", "inTimestampReps", "inAddrMasks", "inAddrMaskReps",
+	"outMsgs", "outErrors", "outDestUnreachs", "outTimeExcds",
+	"outParmProbs", "outSrcQuenchs", "outRedirects", "outEchos",
+	"outEchoReps", "outTimestamps", "outTimestampReps", "outAddrMasks",
+	"outAddrMaskReps",
+	NULL
+	}
+};
+static lxpr_snmp_table_t lxpr_snmp_tcp = { "tcp",
+	{
+	"rtoAlgorithm", "rtoMin", "rtoMax", "maxConn", "activeOpens",
+	"passiveOpens", "attemptFails", "estabResets", "currEstab", "inSegs",
+	"outSegs", "retransSegs", "inErrs", "outRsts", "inCsumErrors",
+	NULL
+	}
+};
+static lxpr_snmp_table_t lxpr_snmp_udp = { "udp",
+	{
+	"inDatagrams", "noPorts", "inErrors", "outDatagrams", "rcvbufErrors",
+	"sndbufErrors", "inCsumErrors",
+	NULL
+	}
+};
+
+static lxpr_snmp_table_t *lxpr_net_snmptab[] = {
+	&lxpr_snmp_ip,
+	&lxpr_snmp_icmp,
+	&lxpr_snmp_tcp,
+	&lxpr_snmp_udp,
+	NULL
+};
+
+static void
+lxpr_kstat_print_tab(lxpr_uiobuf_t *uiobuf, lxpr_snmp_table_t *table,
+    kstat_t *kn)
+{
+	kstat_named_t *klist;
+	char upname[KSTAT_STRLEN], upfield[KSTAT_STRLEN];
+	int i, j, num;
+	size_t size;
+
+	klist = (kstat_named_t *)lxpr_kstat_read(kn, B_TRUE, &size, &num);
+	if (klist == NULL)
+		return;
+
+	/* Print the header line, fields capitalized */
+	(void) strncpy(upname, table->lst_proto, KSTAT_STRLEN);
+	upname[0] = toupper(upname[0]);
+	lxpr_uiobuf_printf(uiobuf, "%s:", upname);
+	for (i = 0; table->lst_fields[i] != NULL; i++) {
+		(void) strncpy(upfield, table->lst_fields[i], KSTAT_STRLEN);
+		upfield[0] = toupper(upfield[0]);
+		lxpr_uiobuf_printf(uiobuf, " %s", upfield);
+	}
+	lxpr_uiobuf_printf(uiobuf, "\n%s:", upname);
+
+	/* Then loop back through to print the value line. */
+	for (i = 0; table->lst_fields[i] != NULL; i++) {
+		kstat_named_t *kpoint = NULL;
+		for (j = 0; j < num; j++) {
+			if (strncmp(klist[j].name, table->lst_fields[i],
+			    KSTAT_STRLEN) == 0) {
+				kpoint = &klist[j];
+				break;
+			}
+		}
+		if (kpoint == NULL) {
+			/* Output 0 for unknown fields */
+			lxpr_uiobuf_printf(uiobuf, " 0");
+		} else {
+			switch (kpoint->data_type) {
+			case KSTAT_DATA_INT32:
+				lxpr_uiobuf_printf(uiobuf, " %d",
+				    kpoint->value.i32);
+				break;
+			case KSTAT_DATA_UINT32:
+				lxpr_uiobuf_printf(uiobuf, " %u",
+				    kpoint->value.ui32);
+				break;
+			case KSTAT_DATA_INT64:
+				lxpr_uiobuf_printf(uiobuf, " %ld",
+				    kpoint->value.l);
+				break;
+			case KSTAT_DATA_UINT64:
+				lxpr_uiobuf_printf(uiobuf, " %lu",
+				    kpoint->value.ul);
+				break;
+			}
+		}
+	}
+	lxpr_uiobuf_printf(uiobuf, "\n");
+	kmem_free(klist, size);
+}
+
 /* ARGSUSED */
 static void
 lxpr_read_net_snmp(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
+	kstat_t *ksr;
+	kstat_t ks0;
+	lxpr_snmp_table_t **table = lxpr_net_snmptab;
+	int i, t, nidx;
+	size_t sidx;
+
+	ks0.ks_kid = 0;
+	ksr = (kstat_t *)lxpr_kstat_read(&ks0, B_FALSE, &sidx, &nidx);
+	if (ksr == NULL)
+		return;
+
+	for (t = 0; table[t] != NULL; t++) {
+		for (i = 0; i < nidx; i++) {
+			if (strncmp(ksr[i].ks_class, "mib2", KSTAT_STRLEN) != 0)
+				continue;
+			if (strncmp(ksr[i].ks_name, table[t]->lst_proto,
+			    KSTAT_STRLEN) == 0) {
+				lxpr_kstat_print_tab(uiobuf, table[t], &ksr[i]);
+				break;
+			}
+		}
+	}
+	kmem_free(ksr, sidx);
 }
 
 /* ARGSUSED */
@@ -1636,22 +2186,382 @@ lxpr_read_net_stat(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
 }
 
+static int
+lxpr_convert_tcp_state(int st)
+{
+	/*
+	 * Derived from the enum located in the Linux kernel sources:
+	 * include/net/tcp_states.h
+	 */
+	switch (st) {
+	case TCPS_ESTABLISHED:
+		return (1);
+	case TCPS_SYN_SENT:
+		return (2);
+	case TCPS_SYN_RCVD:
+		return (3);
+	case TCPS_FIN_WAIT_1:
+		return (4);
+	case TCPS_FIN_WAIT_2:
+		return (5);
+	case TCPS_TIME_WAIT:
+		return (6);
+	case TCPS_CLOSED:
+		return (7);
+	case TCPS_CLOSE_WAIT:
+		return (8);
+	case TCPS_LAST_ACK:
+		return (9);
+	case TCPS_LISTEN:
+		return (10);
+	case TCPS_CLOSING:
+		return (11);
+	default:
+		/* No translation for TCPS_IDLE, TCPS_BOUND or anything else */
+		return (0);
+	}
+}
+
+static void
+lxpr_format_tcp(lxpr_uiobuf_t *uiobuf, ushort_t ipver)
+{
+	int i, sl = 0;
+	connf_t *connfp;
+	conn_t *connp;
+	netstack_t *ns;
+	ip_stack_t *ipst;
+
+	ASSERT(ipver == IPV4_VERSION || ipver == IPV6_VERSION);
+	if (ipver == IPV4_VERSION) {
+		lxpr_uiobuf_printf(uiobuf, "  sl  local_address rem_address   "
+		    "st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout "
+		    "inode\n");
+	} else {
+		lxpr_uiobuf_printf(uiobuf, "  sl  "
+		    "local_address                         "
+		    "remote_address                        "
+		    "st tx_queue rx_queue tr tm->when retrnsmt   "
+		    "uid  timeout inode\n");
+	}
+	/*
+	 * Due to differences between the Linux and illumos TCP
+	 * implementations, some data will be omitted from the output here.
+	 *
+	 * Valid fields:
+	 *  - local_address
+	 *  - remote_address
+	 *  - st
+	 *  - tx_queue
+	 *  - rx_queue
+	 *  - uid
+	 *  - inode
+	 *
+	 * Omitted/invalid fields
+	 *  - tr
+	 *  - tm->when
+	 *  - retrnsmt
+	 *  - timeout
+	 */
+
+	ns = netstack_get_current();
+	if (ns == NULL)
+		return;
+	ipst = ns->netstack_ip;
+
+	for (i = 0; i < CONN_G_HASH_SIZE; i++) {
+		connfp = &ipst->ips_ipcl_globalhash_fanout[i];
+		connp = NULL;
+		while ((connp =
+		    ipcl_get_next_conn(connfp, connp, IPCL_TCPCONN)) != NULL) {
+			tcp_t *tcp;
+			vattr_t attr;
+			sonode_t *so = (sonode_t *)connp->conn_upper_handle;
+			vnode_t *vp = (so != NULL) ? so->so_vnode : NULL;
+			if (connp->conn_ipversion != ipver)
+				continue;
+			tcp = connp->conn_tcp;
+			if (ipver == IPV4_VERSION) {
+				lxpr_uiobuf_printf(uiobuf,
+				    "%4d: %08X:%04X %08X:%04X ",
+				    ++sl,
+				    connp->conn_laddr_v4,
+				    ntohs(connp->conn_lport),
+				    connp->conn_faddr_v4,
+				    ntohs(connp->conn_fport));
+			} else {
+				lxpr_uiobuf_printf(uiobuf, "%4d: "
+				    "%08X%08X%08X%08X:%04X "
+				    "%08X%08X%08X%08X:%04X ",
+				    ++sl,
+				    connp->conn_laddr_v6.s6_addr32[0],
+				    connp->conn_laddr_v6.s6_addr32[1],
+				    connp->conn_laddr_v6.s6_addr32[2],
+				    connp->conn_laddr_v6.s6_addr32[3],
+				    ntohs(connp->conn_lport),
+				    connp->conn_faddr_v6.s6_addr32[0],
+				    connp->conn_faddr_v6.s6_addr32[1],
+				    connp->conn_faddr_v6.s6_addr32[2],
+				    connp->conn_faddr_v6.s6_addr32[3],
+				    ntohs(connp->conn_fport));
+			}
+
+			/* fetch the simulated inode for the socket */
+			if (vp == NULL ||
+			    VOP_GETATTR(vp, &attr, 0, CRED(), NULL) != 0)
+				attr.va_nodeid = 0;
+
+			lxpr_uiobuf_printf(uiobuf,
+			    "%02X %08X:%08X %02X:%08X %08X "
+			    "%5u %8d %lu %d %p %u %u %u %u %d\n",
+			    lxpr_convert_tcp_state(tcp->tcp_state),
+			    tcp->tcp_rcv_cnt, tcp->tcp_unsent, /* rx/tx queue */
+			    0, 0, /* tr, when */
+			    0, /* per-connection rexmits aren't tracked today */
+			    connp->conn_cred->cr_uid,
+			    0, /* timeout */
+			    /* inode + more */
+			    (ino_t)attr.va_nodeid, 0, NULL, 0, 0, 0, 0, 0);
+		}
+	}
+	netstack_rele(ns);
+}
+
 /* ARGSUSED */
 static void
 lxpr_read_net_tcp(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
+	lxpr_format_tcp(uiobuf, IPV4_VERSION);
+}
+
+/* ARGSUSED */
+static void
+lxpr_read_net_tcp6(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
+{
+	lxpr_format_tcp(uiobuf, IPV6_VERSION);
+}
+
+static void
+lxpr_format_udp(lxpr_uiobuf_t *uiobuf, ushort_t ipver)
+{
+	int i, sl = 0;
+	connf_t *connfp;
+	conn_t *connp;
+	netstack_t *ns;
+	ip_stack_t *ipst;
+
+	ASSERT(ipver == IPV4_VERSION || ipver == IPV6_VERSION);
+	if (ipver == IPV4_VERSION) {
+		lxpr_uiobuf_printf(uiobuf, "  sl  local_address rem_address"
+		    "   st tx_queue rx_queue tr tm->when retrnsmt   uid"
+		    "  timeout inode ref pointer drops\n");
+	} else {
+		lxpr_uiobuf_printf(uiobuf, "  sl  "
+		    "local_address                         "
+		    "remote_address                        "
+		    "st tx_queue rx_queue tr tm->when retrnsmt   "
+		    "uid  timeout inode ref pointer drops\n");
+	}
+	/*
+	 * Due to differences between the Linux and illumos UDP
+	 * implementations, some data will be omitted from the output here.
+	 *
+	 * Valid fields:
+	 *  - local_address
+	 *  - remote_address
+	 *  - st: limited
+	 *  - uid
+	 *
+	 * Omitted/invalid fields
+	 *  - tx_queue
+	 *  - rx_queue
+	 *  - tr
+	 *  - tm->when
+	 *  - retrnsmt
+	 *  - timeout
+	 *  - inode
+	 */
+
+	ns = netstack_get_current();
+	if (ns == NULL)
+		return;
+	ipst = ns->netstack_ip;
+
+	for (i = 0; i < CONN_G_HASH_SIZE; i++) {
+		connfp = &ipst->ips_ipcl_globalhash_fanout[i];
+		connp = NULL;
+		while ((connp =
+		    ipcl_get_next_conn(connfp, connp, IPCL_UDPCONN)) != NULL) {
+			udp_t *udp;
+			int state = 0;
+			vattr_t attr;
+			sonode_t *so = (sonode_t *)connp->conn_upper_handle;
+			vnode_t *vp = (so != NULL) ? so->so_vnode : NULL;
+			if (connp->conn_ipversion != ipver)
+				continue;
+			udp = connp->conn_udp;
+			if (ipver == IPV4_VERSION) {
+				lxpr_uiobuf_printf(uiobuf,
+				    "%4d: %08X:%04X %08X:%04X ",
+				    ++sl,
+				    connp->conn_laddr_v4,
+				    ntohs(connp->conn_lport),
+				    connp->conn_faddr_v4,
+				    ntohs(connp->conn_fport));
+			} else {
+				lxpr_uiobuf_printf(uiobuf, "%4d: "
+				    "%08X%08X%08X%08X:%04X "
+				    "%08X%08X%08X%08X:%04X ",
+				    ++sl,
+				    connp->conn_laddr_v6.s6_addr32[0],
+				    connp->conn_laddr_v6.s6_addr32[1],
+				    connp->conn_laddr_v6.s6_addr32[2],
+				    connp->conn_laddr_v6.s6_addr32[3],
+				    ntohs(connp->conn_lport),
+				    connp->conn_faddr_v6.s6_addr32[0],
+				    connp->conn_faddr_v6.s6_addr32[1],
+				    connp->conn_faddr_v6.s6_addr32[2],
+				    connp->conn_faddr_v6.s6_addr32[3],
+				    ntohs(connp->conn_fport));
+			}
+
+			switch (udp->udp_state) {
+			case TS_UNBND:
+			case TS_IDLE:
+				state = 7;
+				break;
+			case TS_DATA_XFER:
+				state = 1;
+				break;
+			}
+
+			/* fetch the simulated inode for the socket */
+			if (vp == NULL ||
+			    VOP_GETATTR(vp, &attr, 0, CRED(), NULL) != 0)
+				attr.va_nodeid = 0;
+
+			lxpr_uiobuf_printf(uiobuf,
+			    "%02X %08X:%08X %02X:%08X %08X "
+			    "%5u %8d %lu %d %p %d\n",
+			    state,
+			    0, 0, /* rx/tx queue */
+			    0, 0, /* tr, when */
+			    0, /* retrans */
+			    connp->conn_cred->cr_uid,
+			    0, /* timeout */
+			    /* inode, ref, pointer, drops */
+			    (ino_t)attr.va_nodeid, 0, NULL, 0);
+		}
+	}
+	netstack_rele(ns);
 }
 
 /* ARGSUSED */
 static void
 lxpr_read_net_udp(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
+	lxpr_format_udp(uiobuf, IPV4_VERSION);
+}
+
+/* ARGSUSED */
+static void
+lxpr_read_net_udp6(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
+{
+	lxpr_format_udp(uiobuf, IPV6_VERSION);
 }
 
 /* ARGSUSED */
 static void
 lxpr_read_net_unix(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 {
+	sonode_t *so;
+	zoneid_t zoneid = getzoneid();
+
+	lxpr_uiobuf_printf(uiobuf, "Num       RefCount Protocol Flags    Type "
+	    "St Inode Path\n");
+
+	mutex_enter(&socklist.sl_lock);
+	for (so = socklist.sl_list; so != NULL;
+	    so = _SOTOTPI(so)->sti_next_so) {
+		vnode_t *vp = so->so_vnode;
+		vattr_t attr;
+		sotpi_info_t *sti;
+		const char *name = NULL;
+		int status = 0;
+		int type = 0;
+		int flags = 0;
+
+		/* Only process active sonodes in this zone */
+		if (so->so_count == 0 || so->so_zoneid != zoneid)
+			continue;
+
+		/*
+		 * Grab the inode, if possible.
+		 * This must be done before entering so_lock.
+		 */
+		if (vp == NULL ||
+		    VOP_GETATTR(vp, &attr, 0, CRED(), NULL) != 0)
+			attr.va_nodeid = 0;
+
+		mutex_enter(&so->so_lock);
+		sti = _SOTOTPI(so);
+
+		if (sti->sti_laddr_sa != NULL)
+			name = sti->sti_laddr_sa->sa_data;
+		else if (sti->sti_faddr_sa != NULL)
+			name = sti->sti_faddr_sa->sa_data;
+
+		/*
+		 * Derived from enum values in Linux kernel source:
+		 * include/uapi/linux/net.h
+		 */
+		if ((so->so_state & SS_ISDISCONNECTING) != 0) {
+			status = 4;
+		} else if ((so->so_state & SS_ISCONNECTING) != 0) {
+			status = 2;
+		} else if ((so->so_state & SS_ISCONNECTED) != 0) {
+			status = 3;
+		} else {
+			status = 1;
+			/* Add ACC flag for stream-type server sockets */
+			if (so->so_type != SOCK_DGRAM &&
+			    sti->sti_laddr_sa != NULL)
+				flags |= 0x10000;
+		}
+
+		/* Convert to Linux type */
+		switch (so->so_type) {
+		case SOCK_DGRAM:
+			type = 2;
+			break;
+		case SOCK_SEQPACKET:
+			type = 5;
+			break;
+		default:
+			type = 1;
+		}
+
+		lxpr_uiobuf_printf(uiobuf, "%p: %08X %08X %08X %04X %02X %5llu",
+		    so,
+		    so->so_count,
+		    0, /* proto, always 0 */
+		    flags,
+		    type,
+		    status,
+		    (ino_t)attr.va_nodeid);
+
+		/*
+		 * Due to shortcomings in the abstract socket emulation, they
+		 * cannot be properly represented here (as @<path>).
+		 *
+		 * This will be the case until they are better implemented.
+		 */
+		if (name != NULL)
+			lxpr_uiobuf_printf(uiobuf, " %s\n", name);
+		else
+			lxpr_uiobuf_printf(uiobuf, "\n");
+		mutex_exit(&so->so_lock);
+	}
+	mutex_exit(&socklist.sl_lock);
 }
 
 /*
@@ -1801,9 +2711,6 @@ lxpr_read_meminfo(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 	}
 
 	lxpr_uiobuf_printf(uiobuf,
-	    "        total:     used:    free:  shared: buffers:  cached:\n"
-	    "Mem:  %8lu %8lu %8lu %8u %8u %8u\n"
-	    "Swap: %8lu %8lu %8lu\n"
 	    "MemTotal:  %8lu kB\n"
 	    "MemFree:   %8lu kB\n"
 	    "MemShared: %8u kB\n"
@@ -1818,8 +2725,6 @@ lxpr_read_meminfo(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 	    "LowFree:   %8u kB\n"
 	    "SwapTotal: %8lu kB\n"
 	    "SwapFree:  %8lu kB\n",
-	    total_mem, total_mem - free_mem, free_mem, 0, 0, 0,
-	    total_swap, used_swap, total_swap - used_swap,
 	    btok(total_mem),				/* MemTotal */
 	    btok(free_mem),				/* MemFree */
 	    0,						/* MemShared */
@@ -2195,6 +3100,21 @@ lxpr_read_stat(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
 		    boot_time,
 		    forks_cum);
 	}
+}
+
+/*
+ * lxpr_read_swaps():
+ *
+ * We don't support swap files or partitions, so just provide a dummy file with
+ * the necessary header.
+ */
+/* ARGSUSED */
+static void
+lxpr_read_swaps(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
+{
+	lxpr_uiobuf_printf(uiobuf,
+	    "Filename                                "
+	    "Type            Size    Used    Priority\n");
 }
 
 /*
@@ -2649,6 +3569,13 @@ lxpr_getattr(vnode_t *vp, vattr_t *vap, int flags, cred_t *cr,
 		vap->va_uid = crgetruid(curproc->p_cred);
 		vap->va_gid = crgetrgid(curproc->p_cred);
 		break;
+	case LXPR_PID_FD_FD:
+		/*
+		 * Restore VLNK type for lstat-type activity.
+		 * See lxpr_readlink for more details.
+		 */
+		if ((flags & FOLLOW) == 0)
+			vap->va_type = VLNK;
 	default:
 		break;
 	}
@@ -2930,17 +3857,15 @@ lxpr_lookup_fddir(vnode_t *dp, char *comp)
 		 */
 		lxpnp->lxpr_realvp = vp;
 		VN_HOLD(lxpnp->lxpr_realvp);
-		if (lxpnp->lxpr_realvp->v_type == VFIFO) {
-			/*
-			 * lxpr_getnode initially sets the type to be VLNK for
-			 * the LXPR_PID_FD_FD option, but that breaks fifo
-			 * file descriptors (which are unlinked named pipes).
-			 * We set this as a regular file so that open.2 comes
-			 * into lxpr_open so we can do more work.
-			 */
-			dp = LXPTOV(lxpnp);
-			dp->v_type = VREG;
-		}
+		/*
+		 * For certain entries (sockets, pipes, etc), Linux expects a
+		 * bogus-named symlink.  If that's the case, report the type as
+		 * VNON to bypass link-following elsewhere in the vfs system.
+		 *
+		 * See lxpr_readlink for more details.
+		 */
+		if (lxpr_readlink_pid_fd(lxpnp, NULL, 0) == 0)
+			LXPTOV(lxpnp)->v_type = VNON;
 	}
 
 	mutex_enter(&p->p_lock);
@@ -3276,11 +4201,16 @@ lxpr_readdir_procdir(lxpr_node_t *lxpnp, uio_t *uiop, int *eofp)
 
 		/*
 		 * Convert pid to the Linux default of 1 if we're the zone's
-		 * init process, otherwise use the value from the proc
-		 * structure
+		 * init process, or 0 if zsched, otherwise use the value from
+		 * the proc structure
 		 */
-		pid = ((p->p_pid != curproc->p_zone->zone_proc_initpid) ?
-		    p->p_pid : 1);
+		if (p->p_pid == curproc->p_zone->zone_proc_initpid) {
+			pid = 1;
+		} else if (p->p_pid == curproc->p_zone->zone_zsched->p_pid) {
+			pid = 0;
+		} else {
+			pid = p->p_pid;
+		}
 
 		/*
 		 * If this /proc was mounted in the global zone, view
@@ -3340,14 +4270,21 @@ static int
 lxpr_readdir_piddir(lxpr_node_t *lxpnp, uio_t *uiop, int *eofp)
 {
 	proc_t *p;
+	pid_t find_pid;
 
 	ASSERT(lxpnp->lxpr_type == LXPR_PIDDIR);
 
 	/* can't read its contents if it died */
 	mutex_enter(&pidlock);
 
-	p = prfind((lxpnp->lxpr_pid == 1) ?
-	    curproc->p_zone->zone_proc_initpid : lxpnp->lxpr_pid);
+	if (lxpnp->lxpr_pid == 1) {
+		find_pid = curproc->p_zone->zone_proc_initpid;
+	} else if (lxpnp->lxpr_pid == 0) {
+		find_pid = curproc->p_zone->zone_zsched->p_pid;
+	} else {
+		find_pid = lxpnp->lxpr_pid;
+	}
+	p = prfind(find_pid);
 
 	if (p == NULL || p->p_stat == SIDL) {
 		mutex_exit(&pidlock);
@@ -3520,26 +4457,57 @@ lxpr_readlink(vnode_t *vp, uio_t *uiop, cred_t *cr, caller_context_t *ct)
 	pid_t pid;
 	int error = 0;
 
-	/* must be a symbolic link file */
-	if (vp->v_type != VLNK)
+	/*
+	 * Linux does something very "clever" for /proc/<pid>/fd/<num> entries.
+	 * Open FDs are represented as symlinks, the link contents
+	 * corresponding to the open resource.  For plain files or devices,
+	 * this isn't absurd since one can dereference the symlink to query
+	 * the underlying resource.  For sockets or pipes, it becomes ugly in a
+	 * hurry.  To maintain this human-readable output, those FD symlinks
+	 * point to bogus targets such as "socket:[<inodenum>]".  This requires
+	 * circumventing vfs since the stat/lstat behavior on those FD entries
+	 * will be unusual. (A stat must retrieve information about the open
+	 * socket or pipe.  It cannot fail because the link contents point to
+	 * an absent file.)
+	 *
+	 * To accomplish this, lxpr_getnode returns an vnode typed VNON for FD
+	 * entries.  This bypasses code paths which would normally
+	 * short-circuit on symlinks and allows us to emulate the vfs behavior
+	 * expected by /proc consumers.
+	 */
+	if (vp->v_type != VLNK && lxpnp->lxpr_type != LXPR_PID_FD_FD)
 		return (EINVAL);
 
 	/* Try to produce a symlink name for anything that has a realvp */
 	if (rvp != NULL) {
 		if ((error = lxpr_access(vp, VREAD, 0, CRED(), ct)) != 0)
 			return (error);
-		if ((error = vnodetopath(NULL, rvp, bp, buflen, CRED())) != 0)
-			return (error);
+		if ((error = vnodetopath(NULL, rvp, bp, buflen, CRED())) != 0) {
+			/*
+			 * Special handling possible for /proc/<pid>/fd/<num>
+			 * Generate <type>:[<inode>] links, if allowed.
+			 */
+			if (lxpnp->lxpr_type != LXPR_PID_FD_FD ||
+			    lxpr_readlink_pid_fd(lxpnp, bp, buflen) != 0) {
+				return (error);
+			}
+		}
 	} else {
 		switch (lxpnp->lxpr_type) {
 		case LXPR_SELF:
 			/*
 			 * Convert pid to the Linux default of 1 if we're the
-			 * zone's init process
+			 * zone's init process or 0 if zsched.
 			 */
-			pid = ((curproc->p_pid !=
-			    curproc->p_zone->zone_proc_initpid)
-			    ? curproc->p_pid : 1);
+			if (curproc->p_pid ==
+			    curproc->p_zone->zone_proc_initpid) {
+				pid = 1;
+			} else if (curproc->p_pid ==
+			    curproc->p_zone->zone_zsched->p_pid) {
+				pid = 0;
+			} else {
+				pid = curproc->p_pid;
+			}
 
 			/*
 			 * Don't need to check result as every possible int
@@ -3562,6 +4530,37 @@ lxpr_readlink(vnode_t *vp, uio_t *uiop, cred_t *cr, caller_context_t *ct)
 
 	/* copy the link data to user space */
 	return (uiomove(bp, strlen(bp), UIO_READ, uiop));
+}
+
+/*
+ * Attempt to create Linux-proc-style fake symlinks contents for supported
+ * /proc/<pid>/fd/<#> entries.
+ */
+static int
+lxpr_readlink_pid_fd(lxpr_node_t *lxpnp, char *bp, size_t len)
+{
+	const char *format;
+	vnode_t *rvp = lxpnp->lxpr_realvp;
+	vattr_t attr;
+
+	switch (rvp->v_type) {
+	case VSOCK:
+		format = "socket:[%lu]";
+		break;
+	case VFIFO:
+		format = "pipe:[%lu]";
+		break;
+	default:
+		return (-1);
+	}
+
+	/* Fetch the inode of the underlying vnode */
+	if (VOP_GETATTR(rvp, &attr, 0, CRED(), NULL) != 0)
+		return (-1);
+
+	if (bp != NULL)
+		(void) snprintf(bp, len, format, (ino_t)attr.va_nodeid);
+	return (0);
 }
 
 /*

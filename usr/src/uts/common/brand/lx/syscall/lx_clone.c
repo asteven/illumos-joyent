@@ -21,7 +21,7 @@
 /*
  * Copyright 2006 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
- * Copyright 2014 Joyent, Inc.  All rights reserved.
+ * Copyright 2015 Joyent, Inc.
  */
 
 #include <sys/types.h>
@@ -30,23 +30,11 @@
 #include <sys/brand.h>
 #include <sys/lx_brand.h>
 #include <sys/lx_ldt.h>
+#include <sys/lx_misc.h>
 #include <lx_signum.h>
-
-#define	LX_CSIGNAL		0x000000ff
-#define	LX_CLONE_VM		0x00000100
-#define	LX_CLONE_FS		0x00000200
-#define	LX_CLONE_FILES		0x00000400
-#define	LX_CLONE_SIGHAND	0x00000800
-#define	LX_CLONE_PID		0x00001000
-#define	LX_CLONE_PTRACE		0x00002000
-#define	LX_CLONE_PARENT		0x00008000
-#define	LX_CLONE_THREAD		0x00010000
-#define	LX_CLONE_SYSVSEM	0x00040000
-#define	LX_CLONE_SETTLS		0x00080000
-#define	LX_CLONE_PARENT_SETTID	0x00100000
-#define	LX_CLONE_CHILD_CLEARTID 0x00200000
-#define	LX_CLONE_DETACH		0x00400000
-#define	LX_CLONE_CHILD_SETTID	0x01000000
+#include <lx_syscall.h>
+#include <sys/x86_archext.h>
+#include <sys/controlregs.h>
 
 /*
  * Our lwp has already been created at this point, so this routine is
@@ -54,8 +42,8 @@
  * linux cloned thread.
  */
 /* ARGSUSED */
-long
-lx_clone(int flags, void *stkp, void *ptidp, void *ldtinfo, void *ctidp)
+int
+lx_helper_clone(int64_t *rval, int flags, void *ptidp, void *tls, void *ctidp)
 {
 	struct lx_lwp_data *lwpd = ttolxlwp(curthread);
 	struct lx_proc_data *lproc = ttolxproc(curthread);
@@ -73,29 +61,36 @@ lx_clone(int flags, void *stkp, void *ptidp, void *ldtinfo, void *ctidp)
 		lproc->l_signal = signo;
 	} else {
 		if (flags & LX_CLONE_SETTLS) {
-			if (copyin((caddr_t)ldtinfo, &info, sizeof (info)))
-				return (set_errno(EFAULT));
+			if (get_udatamodel() == DATAMODEL_ILP32) {
+				if (copyin((caddr_t)tls, &info, sizeof (info)))
+					return (set_errno(EFAULT));
 
-			if (LDT_INFO_EMPTY(&info))
-				return (set_errno(EINVAL));
+				if (LDT_INFO_EMPTY(&info))
+					return (set_errno(EINVAL));
 
-			entry = info.entry_number;
-			if (entry < GDT_TLSMIN || entry > GDT_TLSMAX)
-				return (set_errno(EINVAL));
+				entry = info.entry_number;
+				if (entry < GDT_TLSMIN || entry > GDT_TLSMAX)
+					return (set_errno(EINVAL));
 
-			tls_index = entry - GDT_TLSMIN;
+				tls_index = entry - GDT_TLSMIN;
 
-			/*
-			 * Convert the user-space structure into a real x86
-			 * descriptor and copy it into this LWP's TLS array.  We
-			 * also load it into the GDT.
-			 */
-			LDT_INFO_TO_DESC(&info, &descr);
-			bcopy(&descr, &lwpd->br_tls[tls_index], sizeof (descr));
-			lx_set_gdt(entry, &lwpd->br_tls[tls_index]);
-		} else {
-			tls_index = -1;
-			bzero(&descr, sizeof (descr));
+				/*
+				 * Convert the user-space structure into a real
+				 * x86 descriptor and copy it into this LWP's
+				 * TLS array.  We also load it into the GDT.
+				 */
+				LDT_INFO_TO_DESC(&info, &descr);
+				bcopy(&descr, &lwpd->br_tls[tls_index],
+				    sizeof (descr));
+				lx_set_gdt(entry, &lwpd->br_tls[tls_index]);
+			} else {
+				/*
+				 * Set the Linux %fsbase for this LWP.  We will
+				 * restore it the next time we return to Linux
+				 * via setcontext()/lx_restorecontext().
+				 */
+				lwpd->br_lx_fsbase = (uintptr_t)tls;
+			}
 		}
 
 		lwpd->br_clear_ctidp =
@@ -125,7 +120,9 @@ lx_clone(int flags, void *stkp, void *ptidp, void *ldtinfo, void *ctidp)
 			return (set_errno(EFAULT));
 		}
 	}
-	return (lwpd->br_pid);
+
+	*rval = lwpd->br_pid;
+	return (0);
 }
 
 long

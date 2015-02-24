@@ -24,6 +24,7 @@
 # Copyright (c) 2012 by Delphix. All rights reserved.
 # Copyright (c) 2012, Joyent, Inc. All rights reserved.
 # Copyright (c) 2013 Gary Mills
+# Copyright 2014 Garrett D'Amore <garrett@damore.org>
 
 include ../Makefile.master
 
@@ -136,6 +137,7 @@ SUBDIRS += \
 	libpp		\
 	libproc		\
 	libproject	\
+	librename	\
 	libsendfile	\
 	nametoaddr	\
 	ncad_addr	\
@@ -161,7 +163,9 @@ SUBDIRS += \
 	libm1		\
 	libm		\
 	libmvec		\
-	libvnd
+	libvnd		\
+	libidspace	\
+	libbunyan
 
 SUBDIRS += \
 	passwdutil	\
@@ -173,7 +177,6 @@ SUBDIRS += \
 	libvolmgt	\
 	libdevice	\
 	libdevid	\
-	libdhcpsvc	\
 	libc_db		\
 	libndmp		\
 	libsec		\
@@ -181,7 +184,6 @@ SUBDIRS += \
 	libtnf		\
 	libtnfctl	\
 	libdhcpagent	\
-	libdhcpdu	\
 	libdhcputil	\
 	libxnet		\
 	libipsecutil	\
@@ -312,7 +314,6 @@ MSGSUBDIRS=		\
 	libcmd		\
 	libcontract	\
 	libcurses	\
-	libdhcpsvc 	\
 	libdhcputil	\
 	libipsecutil	\
 	libdiskmgt	\
@@ -373,6 +374,7 @@ HDRSUBDIRS=		\
 	libast		\
 	libbrand	\
 	libbsm		\
+	libbunyan	\
 	libc		\
 	libcmd		\
 	libcmdutils	\
@@ -391,7 +393,6 @@ HDRSUBDIRS=		\
 	libdll		\
 	libdlpi		\
 	libdhcpagent	\
-	libdhcpsvc	\
 	libdhcputil	\
 	libdisasm	\
 	libdns_sd	\
@@ -403,6 +404,7 @@ HDRSUBDIRS=		\
 	libfru		\
 	libfstyp	\
 	libgen		\
+	libidspace	\
 	libipadm	\
 	libipd		\
 	libipsecutil	\
@@ -434,6 +436,7 @@ HDRSUBDIRS=		\
 	libraidcfg	\
 	librcm		\
 	librdc		\
+	librename	\
 	libscf		\
 	libsip		\
 	libsmbios	\
@@ -569,7 +572,6 @@ libcontract:	libnvpair
 libdevid:	libdevinfo
 libdevinfo:	libnvpair libsec
 libdhcpagent:	libsocket libdhcputil libuuid libdlpi libcontract
-libdhcpsvc:	libinetutil
 libdhcputil:	libnsl libgen libinetutil libdlpi
 libdladm:	libdevinfo libinetutil libsocket libscf librcm libnvpair \
 		libexacct libnsl libkstat libcurses
@@ -666,6 +668,8 @@ libprtdiag:	libm
 libsqlite:	libm
 libstmf:	libm
 libvscan: 	libm
+libidspace:	libumem
+libbunyan:	libnvpair
 
 
 $(INTEL_BUILD)libdiskmgt:libfdisk
